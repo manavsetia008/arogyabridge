@@ -1,0 +1,1437 @@
+# """
+# ArogyaBridge - "Bridge to Healthcare"
+# SIH 2026 | PS ID: SIH26133
+# Streamlit Prototype (MVP) for live demo
+
+# Demo flow:
+# ASHA registers patient (optionally OFFLINE) -> runs AI triage (symptoms + vitals) -> flags HIGH RISK
+#   -> refers to facility (referral status = PENDING)
+#   -> Receiving facility ACKNOWLEDGES patient arrival (closed-loop referral - core USP)
+#   -> Doctor teleconsults -> writes prescription -> referral COMPLETED
+#   -> Admin Dashboard shows live analytics (referral funnel, turnaround time, outbreak
+#      signals, triage risk, low stock, active emergency alerts)
+
+# NEW in this version (v2 - feature additions on top of the merged Flask-design build):
+#   1. Vitals-aware AI triage: SpO2, temperature, pulse and BP are now captured
+#      alongside free-text symptoms. A vitals-risk engine cross-checks these against
+#      clinical thresholds and escalates priority even if the text alone looks mild
+#      (e.g. "feeling tired" + SpO2 87% -> RED). This directly strengthens the
+#      "AI-based digital triage" claim in the pitch deck.
+#   2. Functional Emergency SOS: the SOS button (patient portal) and a new
+#      "Trigger Emergency SOS" action (ASHA, for RED cases) now actually write to
+#      an `emergency_alerts` table instead of just showing a toast. These surface
+#      live at the top of the District Admin Dashboard until marked resolved -
+#      this is the "Emergency alerts in critical cases" feature from the deck.
+#   3. Village-level outbreak signal detection: the Admin Dashboard now scans
+#      recent triage records grouped by village and flags villages crossing a
+#      RED/YELLOW cluster threshold - the "Area-wise disease trend visibility"
+#      USP from the innovation slide.
+#   4. Referral turnaround analytics: average time from PENDING -> ACKNOWLEDGED
+#      and ACKNOWLEDGED -> COMPLETED is now computed and charted, giving judges
+#      a hard number for "the referral black hole is closed, and closed fast."
+#   5. CSV data export for patients / triage / referrals tables, and a
+#      downloadable prescription (plain text) for both the doctor and the
+#      patient portal - closes the loop on "the patient actually leaves with
+#      something," and gives the admin exportable data for reporting upward.
+#   6. Lightweight role PIN-gating for ASHA / Doctor / Admin dashboards. This is
+#      a demo-grade stand-in for real auth (see README) so the pitch can talk
+#      about access control without needing a full identity provider.
+#   7. Optional QR code rendering of the ABHA-linked ID on registration, for a
+#      nicer physical hand-off moment in the live demo (falls back quietly if
+#      the `qrcode` package is not installed).
+
+# Run:
+#     pip install -r requirements.txt
+#     streamlit run app.py
+
+# Optional (for real LLM-based triage instead of the built-in rule engine):
+#     export GROQ_API_KEY=your_key_here
+
+# Optional (demo-grade role PINs, otherwise defaults shown in-app are used):
+#     export ASHA_PIN=1111
+#     export DOCTOR_PIN=2222
+#     export ADMIN_PIN=3333
+# """
+
+# import os
+# import sqlite3
+# import uuid
+# import random
+# import hashlib
+# import secrets
+# from datetime import datetime, timedelta
+
+# import pandas as pd
+# import streamlit as st
+
+# # ---------------------------------------------------------------------------
+# # CONFIG
+# # ---------------------------------------------------------------------------
+# DB_PATH = os.path.join(os.path.dirname(__file__), "arogyabridge.db")
+# GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+# GROQ_MODEL = "llama-3.1-8b-instant"
+
+# DEMO_PINS = {
+#     "asha": os.environ.get("ASHA_PIN", "1111"),
+#     "doctor": os.environ.get("DOCTOR_PIN", "2222"),
+#     "admin": os.environ.get("ADMIN_PIN", "3333"),
+# }
+
+# OUTBREAK_CLUSTER_THRESHOLD = 3   # >= this many RED/YELLOW cases in a village -> flag
+# OUTBREAK_LOOKBACK_DAYS = 30      # only consider triage records from the last N days
+
+# st.set_page_config(
+#     page_title="ArogyaBridge | SIH26133",
+#     page_icon="🩺",
+#     layout="wide",
+#     initial_sidebar_state="expanded",
+# )
+
+# PRIORITY_COLORS = {"RED": "#e53935", "YELLOW": "#fbc02d", "GREEN": "#43a047"}
+# PRIORITY_ORDER = {"RED": 0, "YELLOW": 1, "GREEN": 2}
+
+# STATUS_COLORS = {"PENDING": "#fb8c00", "ACKNOWLEDGED": "#1e88e5", "COMPLETED": "#43a047"}
+# STATUS_ORDER = {"PENDING": 0, "ACKNOWLEDGED": 1, "COMPLETED": 2}
+
+# FACILITIES = [
+#     "Sub-Centre Wagholi",
+#     "PHC Ranjangaon",
+#     "District Hospital Pune",
+# ]
+
+# # ---------------------------------------------------------------------------
+# # I18N (minimal, extensible)
+# # ---------------------------------------------------------------------------
+# T = {
+#     "en": {
+#         "app_title": "ArogyaBridge — Bridge to Healthcare",
+#         "role": "Select your role",
+#         "asha": "ASHA / ANM Worker",
+#         "doctor": "Doctor / Facility Dashboard",
+#         "admin": "District Admin Dashboard",
+#         "medicine": "Medicine Stock Checker",
+#         "register_patient": "Register New Patient",
+#         "name": "Full Name",
+#         "age": "Age",
+#         "gender": "Gender",
+#         "village": "Village / Ward",
+#         "phone": "Phone Number",
+#         "language": "Preferred Language",
+#         "register_btn": "Register Patient (Generate ABHA-linked ID)",
+#         "symptoms": "Describe symptoms",
+#         "run_triage": "Run AI Triage",
+#         "priority": "Priority",
+#         "refer_btn": "Refer to Facility",
+#         "select_facility": "Refer to which facility?",
+#         "queue": "Live Patient Queue",
+#         "no_referrals": "No referrals in queue yet.",
+#         "prescription": "Prescription",
+#         "save_prescription": "Save Prescription & Complete Referral",
+#         "teleconsult": "Start Teleconsultation (WebRTC)",
+#         "patient_portal": "Patient Portal",
+#         "login": "Login",
+#         "register_tab": "Register",
+#         "login_btn": "Login",
+#         "confirm_password": "Confirm Password",
+#         "password": "Password",
+#         "invalid_login": "Invalid phone number or password.",
+#         "welcome_back": "Welcome back",
+#         "my_health_record": "My Health Record",
+#         "my_triage_history": "My Symptom / Triage History",
+#         "my_referrals": "My Referrals & Prescriptions",
+#         "book_appointment": "Book Appointment",
+#         "sos": "Emergency SOS",
+#         "logout_btn": "Logout",
+#         "no_records_yet": "No records yet.",
+#         "create_login": "Create your app login",
+#         "phone_login_hint": "Use your registered phone number to log in.",
+#         # --- closed-loop referral + offline mode ---
+#         "acknowledge_btn": "✅ Acknowledge Patient Arrival",
+#         "awaiting_arrival": "Awaiting patient arrival at this facility.",
+#         "acknowledged_on": "Arrival acknowledged on",
+#         "acknowledged_by": "Acknowledged by",
+#         "doctor_name_label": "Your name (Doctor / Facility Staff)",
+#         "offline_mode": "📴 Simulate Offline Mode (ASHA)",
+#         "offline_hint": "When ON, new patients / triage / referrals are saved only in this session (not the database) - just like an offline PWA saving to local storage. Turn it OFF and sync to push them to the server.",
+#         "pending_sync": "Pending Sync Queue",
+#         "sync_now": "🔄 Sync Now",
+#         "synced_msg": "Synced {n} record(s) to the central server.",
+#         "saved_offline": "Saved locally (offline mode) - will sync when connectivity returns.",
+#         "status_pending": "PENDING (awaiting arrival)",
+#         "status_ack": "ACKNOWLEDGED (patient arrived)",
+#         "status_completed": "COMPLETED",
+#         "referral_funnel": "Referral Funnel (Closed-Loop Tracking)",
+#         # --- v2 additions ---
+#         "vitals_section": "Vitals (optional, but improves triage accuracy)",
+#         "temp_label": "Temperature (°F)",
+#         "spo2_label": "SpO2 (%)",
+#         "pulse_label": "Pulse (bpm)",
+#         "bp_sys_label": "BP Systolic",
+#         "bp_dia_label": "BP Diastolic",
+#         "vitals_hint": "Leave a field at 0 if not measured.",
+#         "trigger_sos_btn": "🚨 Trigger Emergency SOS for this Patient",
+#         "sos_logged": "🚨 Emergency SOS logged — now visible on the District Admin Dashboard.",
+#         "resolve_btn": "Mark Resolved",
+#         "active_alerts": "🚨 Active Emergency Alerts",
+#         "no_active_alerts": "No active emergency alerts.",
+#         "outbreak_section": "📈 Village Outbreak Signals",
+#         "no_outbreak": "No outbreak clusters detected in the selected window.",
+#         "turnaround_section": "⏱️ Referral Turnaround Time (Closed-Loop Efficiency)",
+#         "download_csv": "⬇️ Download CSV",
+#         "download_prescription": "⬇️ Download Prescription",
+#         "pin_unlock": "Unlock",
+#         "pin_label": "Enter PIN",
+#         "pin_wrong": "Incorrect PIN — please try again.",
+#         "pin_hint": "🔒 Demo access control — enter the PIN to continue.",
+#         "search_patient": "Search by patient name",
+#     },
+#     "hi": {
+#         "app_title": "ArogyaBridge — स्वास्थ्य सेवा का पुल",
+#         "role": "अपनी भूमिका चुनें",
+#         "asha": "आशा / एएनएम कार्यकर्ता",
+#         "doctor": "डॉक्टर / सुविधा डैशबोर्ड",
+#         "admin": "जिला प्रशासन डैशबोर्ड",
+#         "medicine": "दवा स्टॉक जांच",
+#         "register_patient": "नया रोगी पंजीकृत करें",
+#         "name": "पूरा नाम",
+#         "age": "आयु",
+#         "gender": "लिंग",
+#         "village": "गाँव / वार्ड",
+#         "phone": "फ़ोन नंबर",
+#         "language": "पसंदीदा भाषा",
+#         "register_btn": "रोगी पंजीकृत करें (ABHA ID बनाएं)",
+#         "symptoms": "लक्षण बताएं",
+#         "run_triage": "AI ट्राइएज चलाएं",
+#         "priority": "प्राथमिकता",
+#         "refer_btn": "सुविधा के लिए रेफर करें",
+#         "select_facility": "किस सुविधा के लिए रेफर करें?",
+#         "queue": "लाइव रोगी कतार",
+#         "no_referrals": "कतार में अभी कोई रेफरल नहीं है।",
+#         "prescription": "नुस्खा",
+#         "save_prescription": "नुस्खा सहेजें और रेफरल पूरा करें",
+#         "teleconsult": "टेलीकंसल्टेशन शुरू करें (WebRTC)",
+#         "patient_portal": "रोगी पोर्टल",
+#         "login": "लॉगिन",
+#         "register_tab": "पंजीकरण करें",
+#         "login_btn": "लॉगिन करें",
+#         "confirm_password": "पासवर्ड की पुष्टि करें",
+#         "password": "पासवर्ड",
+#         "invalid_login": "फ़ोन नंबर या पासवर्ड गलत है।",
+#         "welcome_back": "वापसी पर स्वागत है",
+#         "my_health_record": "मेरा स्वास्थ्य रिकॉर्ड",
+#         "my_triage_history": "मेरा लक्षण / ट्राइएज इतिहास",
+#         "my_referrals": "मेरे रेफरल और नुस्खे",
+#         "book_appointment": "अपॉइंटमेंट बुक करें",
+#         "sos": "आपातकालीन SOS",
+#         "logout_btn": "लॉगआउट",
+#         "no_records_yet": "अभी तक कोई रिकॉर्ड नहीं है।",
+#         "create_login": "अपना ऐप लॉगिन बनाएं",
+#         "phone_login_hint": "लॉगिन करने के लिए अपना पंजीकृत फ़ोन नंबर उपयोग करें।",
+#     },
+#     "mr": {
+#         "app_title": "ArogyaBridge — आरोग्यसेवेचा पूल",
+#         "role": "तुमची भूमिका निवडा",
+#         "asha": "आशा / एएनएम कार्यकर्ता",
+#         "doctor": "डॉक्टर / सुविधा डॅशबोर्ड",
+#         "admin": "जिल्हा प्रशासन डॅशबोर्ड",
+#         "medicine": "औषध साठा तपासणी",
+#         "register_patient": "नवीन रुग्ण नोंदणी",
+#         "name": "पूर्ण नाव",
+#         "age": "वय",
+#         "gender": "लिंग",
+#         "village": "गाव / वॉर्ड",
+#         "phone": "फोन नंबर",
+#         "language": "पसंतीची भाषा",
+#         "register_btn": "रुग्ण नोंदणी करा (ABHA ID तयार करा)",
+#         "symptoms": "लक्षणे सांगा",
+#         "run_triage": "AI ट्रायएज चालवा",
+#         "priority": "प्राधान्य",
+#         "refer_btn": "सुविधेकडे संदर्भित करा",
+#         "select_facility": "कोणत्या सुविधेकडे संदर्भित करायचे?",
+#         "queue": "थेट रुग्ण रांग",
+#         "no_referrals": "रांगेत अद्याप कोणतेही संदर्भ नाहीत.",
+#         "prescription": "प्रिस्क्रिप्शन",
+#         "save_prescription": "प्रिस्क्रिप्शन जतन करा आणि संदर्भ पूर्ण करा",
+#         "teleconsult": "टेलिकन्सल्टेशन सुरू करा (WebRTC)",
+#     },
+#     "ta": {
+#         "app_title": "ArogyaBridge — சுகாதார சேவைக்கான பாலம்",
+#         "role": "உங்கள் பாத்திரத்தைத் தேர்ந்தெடுக்கவும்",
+#         "asha": "ஆஷா / ஏஎன்எம் பணியாளர்",
+#         "doctor": "மருத்துவர் / மையம் டாஷ்போர்டு",
+#         "admin": "மாவட்ட நிர்வாக டாஷ்போர்டு",
+#         "medicine": "மருந்து கையிருப்பு சரிபார்ப்பு",
+#         "register_patient": "புதிய நோயாளியைப் பதிவு செய்யவும்",
+#         "name": "முழுப் பெயர்",
+#         "age": "வயது",
+#         "gender": "பாலினம்",
+#         "village": "கிராமம் / வார்டு",
+#         "phone": "தொலைபேசி எண்",
+#         "language": "விருப்பமான மொழி",
+#         "register_btn": "நோயாளியைப் பதிவு செய்யவும் (ABHA ID உருவாக்கவும்)",
+#         "symptoms": "அறிகுறிகளை விவரிக்கவும்",
+#         "run_triage": "AI முன்னுரிமை வகைப்பாட்டை இயக்கவும்",
+#         "priority": "முன்னுரிமை",
+#         "refer_btn": "மையத்திற்கு பரிந்துரைக்கவும்",
+#         "select_facility": "எந்த மையத்திற்கு பரிந்துரைக்க வேண்டும்?",
+#         "queue": "நேரடி நோயாளர் வரிசை",
+#         "no_referrals": "வரிசையில் இதுவரை பரிந்துரைகள் இல்லை.",
+#         "prescription": "மருந்துச் சீட்டு",
+#         "save_prescription": "மருந்துச் சீட்டைச் சேமித்து பரிந்துரையை முடிக்கவும்",
+#         "teleconsult": "தொலைத் தொடர்பு ஆலோசனையைத் தொடங்கவும் (WebRTC)",
+#     },
+#     "te": {
+#         "app_title": "ArogyaBridge — ఆరోగ్య సేవకు వంతెన",
+#         "role": "మీ పాత్రను ఎంచుకోండి",
+#         "asha": "ఆశా / ఏఎన్ఎం కార్యకర్త",
+#         "doctor": "డాక్టర్ / సదుపాయ డాష్‌బోర్డ్",
+#         "admin": "జిల్లా అడ్మిన్ డాష్‌బోర్డ్",
+#         "medicine": "మందుల నిల్వ తనిఖీ",
+#         "register_patient": "కొత్త రోగిని నమోదు చేయండి",
+#         "name": "పూర్తి పేరు",
+#         "age": "వయస్సు",
+#         "gender": "లింగం",
+#         "village": "గ్రామం / వార్డు",
+#         "phone": "ఫోన్ నంబర్",
+#         "language": "ఇష్టమైన భాష",
+#         "register_btn": "రోగిని నమోదు చేయండి (ABHA ID సృష్టించండి)",
+#         "symptoms": "లక్షణాలను వివరించండి",
+#         "run_triage": "AI ట్రయాజ్ నడపండి",
+#         "priority": "ప్రాధాన్యత",
+#         "refer_btn": "సదుపాయానికి రిఫర్ చేయండి",
+#         "select_facility": "ఏ సదుపాయానికి రిఫర్ చేయాలి?",
+#         "queue": "ప్రత్యక్ష రోగుల క్యూ",
+#         "no_referrals": "క్యూలో ఇంకా రిఫరల్స్ లేవు.",
+#         "prescription": "ప్రిస్క్రిప్షన్",
+#         "save_prescription": "ప్రిస్క్రిప్షన్ సేవ్ చేసి రిఫరల్ పూర్తి చేయండి",
+#         "teleconsult": "టెలికన్సల్టేషన్ ప్రారంభించండి (WebRTC)",
+#     },
+#     "bn": {
+#         "app_title": "ArogyaBridge — স্বাস্থ্যসেবার সেতু",
+#         "role": "আপনার ভূমিকা নির্বাচন করুন",
+#         "asha": "আশা / এএনএম কর্মী",
+#         "doctor": "ডাক্তার / সুবিধা ড্যাশবোর্ড",
+#         "admin": "জেলা প্রশাসন ড্যাশবোর্ড",
+#         "medicine": "ওষুধ স্টক পরীক্ষা",
+#         "register_patient": "নতুন রোগী নিবন্ধন করুন",
+#         "name": "পুরো নাম",
+#         "age": "বয়স",
+#         "gender": "লিঙ্গ",
+#         "village": "গ্রাম / ওয়ার্ড",
+#         "phone": "ফোন নম্বর",
+#         "language": "পছন্দের ভাষা",
+#         "register_btn": "রোগী নিবন্ধন করুন (ABHA ID তৈরি করুন)",
+#         "symptoms": "লক্ষণ বর্ণনা করুন",
+#         "run_triage": "AI ট্রায়াজ চালান",
+#         "priority": "অগ্রাধিকার",
+#         "refer_btn": "সুবিধার জন্য রেফার করুন",
+#         "select_facility": "কোন সুবিধায় রেফার করবেন?",
+#         "queue": "লাইভ রোগীর সারি",
+#         "no_referrals": "সারিতে এখনও কোনো রেফারেল নেই।",
+#         "prescription": "প্রেসক্রিপশন",
+#         "save_prescription": "প্রেসক্রিপশন সংরক্ষণ করুন এবং রেফারেল সম্পূর্ণ করুন",
+#         "teleconsult": "টেলিকনসালটেশন শুরু করুন (WebRTC)",
+#     },
+# }
+
+
+# def tr(key: str) -> str:
+#     lang = st.session_state.get("ui_lang", "en")
+#     lang_dict = T.get(lang, T["en"])
+#     if key in lang_dict:
+#         return lang_dict[key]
+#     return T["en"].get(key, key)
+
+
+# # ---------------------------------------------------------------------------
+# # DATABASE
+# # ---------------------------------------------------------------------------
+# def get_conn():
+#     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+#     conn.row_factory = sqlite3.Row
+#     return conn
+
+
+# def init_db():
+#     conn = get_conn()
+#     c = conn.cursor()
+#     c.executescript(
+#         """
+#         CREATE TABLE IF NOT EXISTS patients (
+#             abha_id TEXT PRIMARY KEY,
+#             name TEXT, age INTEGER, gender TEXT,
+#             village TEXT, phone TEXT, language TEXT,
+#             created_at TEXT
+#         );
+#         CREATE TABLE IF NOT EXISTS triage (
+#             id TEXT PRIMARY KEY,
+#             abha_id TEXT,
+#             symptoms_text TEXT,
+#             priority TEXT,
+#             rationale TEXT,
+#             created_by TEXT,
+#             created_at TEXT
+#         );
+#         CREATE TABLE IF NOT EXISTS referrals (
+#             id TEXT PRIMARY KEY,
+#             abha_id TEXT,
+#             triage_id TEXT,
+#             facility TEXT,
+#             status TEXT,
+#             prescription TEXT,
+#             doctor_notes TEXT,
+#             created_at TEXT,
+#             acknowledged_at TEXT,
+#             acknowledged_by TEXT,
+#             completed_at TEXT
+#         );
+#         CREATE TABLE IF NOT EXISTS medicine_stock (
+#             id TEXT PRIMARY KEY,
+#             facility TEXT,
+#             medicine_name TEXT,
+#             quantity INTEGER,
+#             unit TEXT,
+#             last_updated TEXT
+#         );
+#         CREATE TABLE IF NOT EXISTS emergency_alerts (
+#             id TEXT PRIMARY KEY,
+#             abha_id TEXT,
+#             patient_name TEXT,
+#             village TEXT,
+#             triggered_by TEXT,
+#             status TEXT,
+#             created_at TEXT,
+#             resolved_at TEXT
+#         );
+#         """
+#     )
+#     conn.commit()
+
+#     # migration: add login columns to patients table if upgrading from an older schema
+#     existing_cols = [r[1] for r in c.execute("PRAGMA table_info(patients)").fetchall()]
+#     if "password_hash" not in existing_cols:
+#         c.execute("ALTER TABLE patients ADD COLUMN password_hash TEXT")
+#     if "salt" not in existing_cols:
+#         c.execute("ALTER TABLE patients ADD COLUMN salt TEXT")
+
+#     # migration: add closed-loop referral acknowledgment columns if upgrading
+#     existing_ref_cols = [r[1] for r in c.execute("PRAGMA table_info(referrals)").fetchall()]
+#     if "acknowledged_at" not in existing_ref_cols:
+#         c.execute("ALTER TABLE referrals ADD COLUMN acknowledged_at TEXT")
+#     if "acknowledged_by" not in existing_ref_cols:
+#         c.execute("ALTER TABLE referrals ADD COLUMN acknowledged_by TEXT")
+#     conn.commit()
+
+#     # seed medicine stock once
+#     c.execute("SELECT COUNT(*) FROM medicine_stock")
+#     if c.fetchone()[0] == 0:
+#         seed_meds = [
+#             ("Paracetamol 500mg", "tablets", 40),
+#             ("ORS Sachets", "sachets", 5),
+#             ("Iron Folic Acid", "tablets", 120),
+#             ("Amoxicillin 250mg", "capsules", 8),
+#             ("Insulin (Regular)", "vials", 15),
+#             ("ASHA Kit - BP Monitor", "units", 3),
+#             ("Antenatal Vitamin D", "tablets", 60),
+#         ]
+#         for facility in FACILITIES:
+#             for med, unit, base_qty in seed_meds:
+#                 qty = max(0, base_qty + random.randint(-10, 10))
+#                 c.execute(
+#                     "INSERT INTO medicine_stock VALUES (?,?,?,?,?,?)",
+#                     (str(uuid.uuid4()), facility, med, qty, unit, datetime.now().isoformat()),
+#                 )
+#         conn.commit()
+#     conn.close()
+
+
+# # ---------------------------------------------------------------------------
+# # AI TRIAGE ENGINE
+# # rule-based fallback (bilingual keyword matching) + vitals-risk engine
+# # + optional Groq/Llama 3.1
+# # ---------------------------------------------------------------------------
+# RED_FLAGS = [
+#     "chest pain", "severe bleeding", "unconscious", "seizure", "not breathing",
+#     "difficulty breathing", "breathlessness", "convulsion", "high fever infant",
+#     "severe abdominal pain", "stroke", "paralysis", "blue lips",
+#     "सीने में दर्द", "बेहोश", "दौरा", "सांस लेने में तकलीफ", "तेज़ बुखार शिशु",
+#     "अत्यधिक रक्तस्राव", "लकवा",
+# ]
+# YELLOW_FLAGS = [
+#     "fever", "vomiting", "diarrhea", "dehydration", "moderate pain",
+#     "pregnancy bleeding", "high blood pressure", "persistent cough",
+#     "बुखार", "उल्टी", "दस्त", "गर्भावस्था रक्तस्राव", "उच्च रक्तचाप", "लगातार खांसी",
+# ]
+
+
+# def rule_based_triage(symptoms_text: str):
+#     text = symptoms_text.lower()
+#     for flag in RED_FLAGS:
+#         if flag in text:
+#             return "RED", f"Red-flag keyword detected: '{flag}'. Requires immediate escalation."
+#     for flag in YELLOW_FLAGS:
+#         if flag in text:
+#             return "YELLOW", f"Moderate-risk keyword detected: '{flag}'. Needs facility follow-up."
+#     return "GREEN", "No high-risk keywords detected. Routine care advised."
+
+
+# def worse_priority(a: str, b: str) -> str:
+#     """Returns whichever of the two priorities is more severe (RED > YELLOW > GREEN)."""
+#     return a if PRIORITY_ORDER[a] < PRIORITY_ORDER[b] else b
+
+
+# def vitals_risk(temp_f=0.0, spo2=0, pulse=0, bp_sys=0, bp_dia=0):
+#     """Simple clinical-threshold risk scorer for captured vitals.
+#     A value of 0 means 'not measured' and is skipped."""
+#     priority = "GREEN"
+#     reasons = []
+
+#     if spo2 and spo2 < 90:
+#         priority = "RED"
+#         reasons.append(f"SpO2 critically low ({spo2}%)")
+#     elif spo2 and 90 <= spo2 < 94:
+#         priority = worse_priority(priority, "YELLOW")
+#         reasons.append(f"SpO2 borderline ({spo2}%)")
+
+#     if temp_f and temp_f >= 104:
+#         priority = "RED"
+#         reasons.append(f"High fever ({temp_f}°F)")
+#     elif temp_f and temp_f >= 100.4:
+#         priority = worse_priority(priority, "YELLOW")
+#         reasons.append(f"Fever ({temp_f}°F)")
+
+#     if bp_sys and (bp_sys >= 180 or bp_sys <= 90):
+#         priority = "RED"
+#         reasons.append(f"BP critical ({bp_sys}/{bp_dia or '?'} mmHg)")
+#     elif bp_sys and bp_sys >= 140:
+#         priority = worse_priority(priority, "YELLOW")
+#         reasons.append(f"BP elevated ({bp_sys}/{bp_dia or '?'} mmHg)")
+
+#     if pulse and (pulse >= 130 or pulse <= 45):
+#         priority = "RED"
+#         reasons.append(f"Abnormal pulse ({pulse} bpm)")
+
+#     return priority, reasons
+
+
+# def groq_triage(symptoms_text: str):
+#     """Optional: real LLM triage via Groq + Llama 3.1. Falls back silently on any error."""
+#     if not GROQ_API_KEY:
+#         return None
+#     try:
+#         from groq import Groq
+
+#         client = Groq(api_key=GROQ_API_KEY)
+#         prompt = (
+#             "You are a clinical triage assistant for a rural Indian health worker (ASHA). "
+#             "Classify the patient's symptoms into exactly one of RED, YELLOW, GREEN "
+#             "(RED = emergency, refer immediately; YELLOW = needs PHC visit soon; "
+#             "GREEN = routine/self-care). Symptoms may be in Hindi or English. "
+#             "Reply strictly as: PRIORITY|one-sentence rationale.\n\n"
+#             f"Symptoms: {symptoms_text}"
+#         )
+#         resp = client.chat.completions.create(
+#             model=GROQ_MODEL,
+#             messages=[{"role": "user", "content": prompt}],
+#             max_tokens=100,
+#             temperature=0.2,
+#         )
+#         out = resp.choices[0].message.content.strip()
+#         if "|" in out:
+#             priority, rationale = out.split("|", 1)
+#             priority = priority.strip().upper()
+#             if priority in PRIORITY_ORDER:
+#                 return priority, rationale.strip()
+#     except Exception:
+#         return None
+#     return None
+
+
+# def run_triage(symptoms_text: str, vitals: dict | None = None):
+#     """Combines symptom-text triage (LLM or rule-based) with a vitals-risk
+#     check, and returns the more severe of the two along with a combined
+#     rationale. `vitals` is an optional dict with keys temp_f, spo2, pulse,
+#     bp_sys, bp_dia."""
+#     result = groq_triage(symptoms_text)
+#     sym_priority, sym_rationale = result if result else rule_based_triage(symptoms_text)
+
+#     if vitals:
+#         v_priority, v_reasons = vitals_risk(**vitals)
+#         final_priority = worse_priority(sym_priority, v_priority)
+#         if v_reasons:
+#             rationale = sym_rationale + " | Vitals flags: " + "; ".join(v_reasons)
+#         else:
+#             rationale = sym_rationale
+#         return final_priority, rationale
+
+#     return sym_priority, sym_rationale
+
+
+# # ---------------------------------------------------------------------------
+# # HELPERS
+# # ---------------------------------------------------------------------------
+# def gen_abha_id():
+#     return "ABHA-" + str(uuid.uuid4())[:8].upper()
+
+
+# def hash_password(password: str, salt: str = None):
+#     """Simple salted PBKDF2 hash — adequate for a hackathon prototype.
+#     (Production would use a vetted library + HTTPS-only cookies/session tokens.)"""
+#     if salt is None:
+#         salt = secrets.token_hex(16)
+#     pwd_hash = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100_000).hex()
+#     return pwd_hash, salt
+
+
+# def verify_password(password: str, salt: str, stored_hash: str) -> bool:
+#     test_hash, _ = hash_password(password, salt)
+#     return test_hash == stored_hash
+
+
+# def priority_badge(priority: str) -> str:
+#     color = PRIORITY_COLORS.get(priority, "#999")
+#     return f"<span style='background:{color};color:white;padding:3px 10px;border-radius:12px;font-weight:600;font-size:0.8em'>{priority}</span>"
+
+
+# def status_badge(status: str) -> str:
+#     color = STATUS_COLORS.get(status, "#999")
+#     return f"<span style='background:{color};color:white;padding:3px 10px;border-radius:12px;font-weight:600;font-size:0.8em'>{status}</span>"
+
+
+# def df(query, params=()):
+#     conn = get_conn()
+#     d = pd.read_sql_query(query, conn, params=params)
+#     conn.close()
+#     return d
+
+
+# def build_prescription_text(patient_name, abha_id, facility, priority, symptoms_text,
+#                              prescription, doctor_notes, doctor_name, completed_at):
+#     """Formats a simple, human-readable prescription summary for download."""
+#     lines = [
+#         "=" * 46,
+#         "        ArogyaBridge — Prescription Summary",
+#         "=" * 46,
+#         f"Patient Name : {patient_name}",
+#         f"ABHA ID      : {abha_id}",
+#         f"Facility     : {facility}",
+#         f"Triage Prior.: {priority}",
+#         f"Symptoms     : {symptoms_text}",
+#         "-" * 46,
+#         "Prescription:",
+#         prescription or "(none recorded)",
+#         "-" * 46,
+#         f"Doctor Notes : {doctor_notes or '(none)'}",
+#         f"Attending Dr : {doctor_name or '(not recorded)'}",
+#         f"Completed On : {completed_at or '(not recorded)'}",
+#         "=" * 46,
+#         "Generated by ArogyaBridge (SIH26133) — demo prototype, not a legal document.",
+#     ]
+#     return "\n".join(lines)
+
+
+# def maybe_render_qr(data: str, caption: str = ""):
+#     """Renders a QR code image for `data` if the optional `qrcode` package is
+#     installed; silently does nothing otherwise so the app never breaks."""
+#     try:
+#         import qrcode
+#         import io
+
+#         img = qrcode.make(data)
+#         buf = io.BytesIO()
+#         img.save(buf, format="PNG")
+#         st.image(buf.getvalue(), caption=caption, width=150)
+#     except Exception:
+#         pass
+
+
+# # ---------------------------------------------------------------------------
+# # ROLE PIN-GATING (demo-grade access control)
+# # ---------------------------------------------------------------------------
+# def require_pin(role_key: str, role_label: str) -> bool:
+#     """Very lightweight session-based PIN gate for ASHA / Doctor / Admin
+#     dashboards. This is NOT production security - see README - but it lets
+#     the demo talk about access control instead of every role being wide
+#     open to anyone with the URL."""
+#     session_key = f"auth_{role_key}"
+#     if st.session_state.get(session_key):
+#         return True
+
+#     st.info(f"{tr('pin_hint')} (Demo PIN for {role_label}: **{DEMO_PINS[role_key]}**)")
+#     pin = st.text_input(tr("pin_label"), type="password", key=f"pin_input_{role_key}")
+#     if st.button(tr("pin_unlock"), key=f"pin_btn_{role_key}", type="primary"):
+#         if pin == DEMO_PINS[role_key]:
+#             st.session_state[session_key] = True
+#             st.rerun()
+#         else:
+#             st.error(tr("pin_wrong"))
+#     return False
+
+
+# # ---------------------------------------------------------------------------
+# # OFFLINE QUEUE HELPERS
+# # These simulate an offline-first PWA: while "offline mode" is on, new
+# # records are appended to st.session_state.offline_queue instead of being
+# # written to SQLite. "Sync Now" flushes the queue to the database in the
+# # correct dependency order (patients -> triage -> referrals).
+# # ---------------------------------------------------------------------------
+# def queue_offline_record(record_type: str, values: tuple):
+#     st.session_state.offline_queue.append({"type": record_type, "values": values})
+
+
+# def get_offline_patient_options():
+#     """Returns {label: abha_id} for patients currently sitting in the
+#     offline queue (not yet synced to the DB), so the ASHA can still run
+#     triage on them before syncing."""
+#     options = {}
+#     for item in st.session_state.offline_queue:
+#         if item["type"] == "patient":
+#             abha_id, name = item["values"][0], item["values"][1]
+#             options[f"{name} ({abha_id}) [offline - not yet synced]"] = abha_id
+#     return options
+
+
+# def sync_offline_queue():
+#     if not st.session_state.offline_queue:
+#         return 0
+#     conn = get_conn()
+#     c = conn.cursor()
+#     synced = 0
+#     # Flush in dependency order: patients first, then triage, then referrals
+#     for record_type in ("patient", "triage", "referral"):
+#         for item in st.session_state.offline_queue:
+#             if item["type"] != record_type:
+#                 continue
+#             if record_type == "patient":
+#                 c.execute(
+#                     "INSERT OR IGNORE INTO patients "
+#                     "(abha_id, name, age, gender, village, phone, language, created_at, password_hash, salt) "
+#                     "VALUES (?,?,?,?,?,?,?,?,?,?)",
+#                     item["values"],
+#                 )
+#             elif record_type == "triage":
+#                 c.execute("INSERT OR IGNORE INTO triage VALUES (?,?,?,?,?,?,?)", item["values"])
+#             elif record_type == "referral":
+#                 c.execute(
+#                     "INSERT OR IGNORE INTO referrals VALUES (?,?,?,?,?,?,?,?,?,?,?)", item["values"]
+#                 )
+#             synced += 1
+#     conn.commit()
+#     conn.close()
+#     st.session_state.offline_queue = []
+#     return synced
+
+
+# # ---------------------------------------------------------------------------
+# # UI: SIDEBAR
+# # ---------------------------------------------------------------------------
+# init_db()
+
+# if "ui_lang" not in st.session_state:
+#     st.session_state.ui_lang = "en"
+# if "offline_mode" not in st.session_state:
+#     st.session_state.offline_mode = False
+# if "offline_queue" not in st.session_state:
+#     st.session_state.offline_queue = []
+
+# with st.sidebar:
+#     st.markdown("## 🩺 ArogyaBridge")
+#     LANG_LABELS = {
+#         "en": "English",
+#         "hi": "हिंदी (Hindi)",
+#         "mr": "मराठी (Marathi)",
+#         "ta": "தமிழ் (Tamil)",
+#         "te": "తెలుగు (Telugu)",
+#         "bn": "বাংলা (Bengali)",
+#     }
+#     lang_choice = st.selectbox("Language / भाषा", list(LANG_LABELS.values()))
+#     st.session_state.ui_lang = next(code for code, label in LANG_LABELS.items() if label == lang_choice)
+
+#     page = st.radio(
+#         tr("role"),
+#         [tr("patient_portal"), tr("asha"), tr("doctor"), tr("admin"), tr("medicine")],
+#     )
+#     st.divider()
+#     st.caption(
+#         "🟢 AI mode: " + ("Groq Llama 3.1 (live)" if GROQ_API_KEY else "Rule-based + vitals fallback (no API key set)")
+#     )
+
+#     st.divider()
+#     st.markdown("#### 📴 Offline-First Demo")
+#     st.session_state.offline_mode = st.checkbox(
+#         tr("offline_mode"), value=st.session_state.offline_mode, help=tr("offline_hint")
+#     )
+#     queue_len = len(st.session_state.offline_queue)
+#     if queue_len > 0:
+#         st.warning(f"📥 {tr('pending_sync')}: **{queue_len}** record(s)")
+#         if st.button(tr("sync_now"), type="primary", use_container_width=True):
+#             n = sync_offline_queue()
+#             st.success(tr("synced_msg").format(n=n))
+#             st.rerun()
+#     elif st.session_state.offline_mode:
+#         st.caption("No records queued yet — try registering a patient below.")
+
+#     # Live active-emergency badge, visible from any page/role
+#     active_alert_count = df("SELECT COUNT(*) as n FROM emergency_alerts WHERE status='ACTIVE'")["n"][0]
+#     if active_alert_count:
+#         st.divider()
+#         st.error(f"🚨 {active_alert_count} active emergency alert(s) — see Admin Dashboard")
+
+# st.title(tr("app_title"))
+
+# # ---------------------------------------------------------------------------
+# # PAGE: PATIENT PORTAL (self-service login/register for patients)
+# # ---------------------------------------------------------------------------
+# if page == tr("patient_portal"):
+#     if "patient_logged_in" not in st.session_state:
+#         st.session_state.patient_logged_in = False
+#         st.session_state.patient_abha_id = None
+
+#     if not st.session_state.patient_logged_in:
+#         login_tab, register_tab = st.tabs(["🔐 " + tr("login"), "📝 " + tr("register_tab")])
+
+#         with login_tab:
+#             st.caption(tr("phone_login_hint"))
+#             login_phone = st.text_input(tr("phone"), key="login_phone")
+#             login_password = st.text_input(tr("password"), type="password", key="login_password")
+#             if st.button(tr("login_btn"), type="primary"):
+#                 match = df(
+#                     "SELECT abha_id, name, password_hash, salt FROM patients WHERE phone = ? AND password_hash IS NOT NULL",
+#                     (login_phone,),
+#                 )
+#                 if match.empty or not verify_password(login_password, match.iloc[0]["salt"], match.iloc[0]["password_hash"]):
+#                     st.error(tr("invalid_login"))
+#                 else:
+#                     st.session_state.patient_logged_in = True
+#                     st.session_state.patient_abha_id = match.iloc[0]["abha_id"]
+#                     st.session_state.patient_name = match.iloc[0]["name"]
+#                     st.rerun()
+
+#         with register_tab:
+#             st.caption(tr("create_login"))
+#             with st.form("patient_self_register_form"):
+#                 c1, c2 = st.columns(2)
+#                 r_name = c1.text_input(tr("name"), key="r_name")
+#                 r_age = c2.number_input(tr("age"), min_value=0, max_value=120, value=30, key="r_age")
+#                 r_gender = c1.selectbox(tr("gender"), ["Female", "Male", "Other"], key="r_gender")
+#                 r_village = c2.text_input(tr("village"), key="r_village")
+#                 r_phone = c1.text_input(tr("phone"), key="r_phone")
+#                 r_lang = c2.selectbox(tr("language"), ["Marathi", "Hindi", "Tamil", "Telugu", "Bengali", "English"], key="r_lang")
+#                 r_password = c1.text_input(tr("password"), type="password", key="r_password")
+#                 r_confirm = c2.text_input(tr("confirm_password"), type="password", key="r_confirm")
+#                 r_submit = st.form_submit_button(tr("register_btn"), type="primary")
+
+#                 if r_submit:
+#                     existing = df("SELECT abha_id FROM patients WHERE phone = ?", (r_phone,))
+#                     if not r_name or not r_phone:
+#                         st.error("Name and phone number are required.")
+#                     elif not r_password or r_password != r_confirm:
+#                         st.error("Passwords are empty or don't match.")
+#                     elif not existing.empty:
+#                         st.error("An account with this phone number already exists — please log in instead.")
+#                     else:
+#                         pwd_hash, salt = hash_password(r_password)
+#                         new_abha_id = gen_abha_id()
+#                         conn = get_conn()
+#                         conn.execute(
+#                             "INSERT INTO patients (abha_id, name, age, gender, village, phone, language, created_at, password_hash, salt) VALUES (?,?,?,?,?,?,?,?,?,?)",
+#                             (new_abha_id, r_name, r_age, r_gender, r_village, r_phone, r_lang, datetime.now().isoformat(), pwd_hash, salt),
+#                         )
+#                         conn.commit()
+#                         conn.close()
+#                         st.success(f"✅ Account created! Your ABHA-linked ID: **{new_abha_id}**. Please log in from the tab above.")
+#                         maybe_render_qr(new_abha_id, caption="Your ABHA-linked ID")
+
+#     else:
+#         abha_id = st.session_state.patient_abha_id
+#         colA, colB = st.columns([4, 1])
+#         colA.subheader(f"👋 {tr('welcome_back')}, {st.session_state.get('patient_name', '')}")
+#         if colB.button(tr("logout_btn")):
+#             st.session_state.patient_logged_in = False
+#             st.session_state.patient_abha_id = None
+#             st.rerun()
+
+#         profile = df("SELECT * FROM patients WHERE abha_id = ?", (abha_id,))
+#         p = profile.iloc[0]
+
+#         st.divider()
+#         c1, c2, c3 = st.columns(3)
+#         c1.metric("ABHA ID", p["abha_id"])
+#         c2.metric(tr("age"), int(p["age"]))
+#         c3.metric(tr("village"), p["village"] or "—")
+#         maybe_render_qr(str(p["abha_id"]), caption="Your ABHA-linked ID")
+
+#         b1, b2 = st.columns(2)
+#         with b1:
+#             if st.button("📅 " + tr("book_appointment")):
+#                 st.info("Appointment booking + live queue tracker would launch here (Patient App feature).")
+#         with b2:
+#             if st.button("🆘 " + tr("sos"), type="primary"):
+#                 conn = get_conn()
+#                 conn.execute(
+#                     "INSERT INTO emergency_alerts VALUES (?,?,?,?,?,?,?,?)",
+#                     (str(uuid.uuid4()), p["abha_id"], p["name"], p["village"], "Patient Portal (self-reported)",
+#                      "ACTIVE", datetime.now().isoformat(), None),
+#                 )
+#                 conn.commit()
+#                 conn.close()
+#                 st.error(tr("sos_logged"))
+
+#         st.divider()
+#         st.subheader("📋 " + tr("my_health_record"))
+
+#         hist_tab, ref_tab = st.tabs(["🩺 " + tr("my_triage_history"), "📨 " + tr("my_referrals")])
+#         with hist_tab:
+#             triage_hist = df(
+#                 "SELECT symptoms_text, priority, created_by, created_at FROM triage WHERE abha_id = ? ORDER BY created_at DESC",
+#                 (abha_id,),
+#             )
+#             if triage_hist.empty:
+#                 st.info(tr("no_records_yet"))
+#             else:
+#                 st.dataframe(triage_hist, use_container_width=True, hide_index=True)
+
+#         with ref_tab:
+#             ref_hist = df(
+#                 """SELECT r.facility, r.status, r.prescription, r.doctor_notes, r.created_at,
+#                           r.acknowledged_at, r.acknowledged_by, r.completed_at, t.priority, t.symptoms_text
+#                    FROM referrals r JOIN triage t ON t.id = r.triage_id
+#                    WHERE r.abha_id = ? ORDER BY r.created_at DESC""",
+#                 (abha_id,),
+#             )
+#             if ref_hist.empty:
+#                 st.info(tr("no_records_yet"))
+#             else:
+#                 st.dataframe(
+#                     ref_hist[["facility", "status", "prescription", "doctor_notes", "created_at",
+#                               "acknowledged_at", "completed_at"]],
+#                     use_container_width=True, hide_index=True,
+#                 )
+#                 completed = ref_hist[ref_hist["status"] == "COMPLETED"]
+#                 if not completed.empty:
+#                     st.caption("📄 Download a completed prescription:")
+#                     for i, row in completed.iterrows():
+#                         text = build_prescription_text(
+#                             p["name"], p["abha_id"], row["facility"], row["priority"],
+#                             row["symptoms_text"], row["prescription"], row["doctor_notes"],
+#                             row["acknowledged_by"], row["completed_at"],
+#                         )
+#                         st.download_button(
+#                             f"⬇️ {row['facility']} — {row['completed_at']}",
+#                             data=text, file_name=f"prescription_{abha_id}_{i}.txt",
+#                             key=f"presc_dl_{i}",
+#                         )
+
+# # ---------------------------------------------------------------------------
+# # PAGE: ASHA / ANM WORKER
+# # ---------------------------------------------------------------------------
+# elif page == tr("asha"):
+#     if not require_pin("asha", tr("asha")):
+#         st.stop()
+
+#     if st.session_state.offline_mode:
+#         st.info("📴 Offline mode is ON — new records will be queued locally until you sync (see sidebar).")
+
+#     tab1, tab2 = st.tabs(["📝 " + tr("register_patient"), "🤖 " + tr("run_triage") + " & Referral"])
+
+#     with tab1:
+#         with st.form("register_form"):
+#             c1, c2 = st.columns(2)
+#             name = c1.text_input(tr("name"))
+#             age = c2.number_input(tr("age"), min_value=0, max_value=120, value=30)
+#             gender = c1.selectbox(tr("gender"), ["Female", "Male", "Other"])
+#             village = c2.text_input(tr("village"))
+#             phone = c1.text_input(tr("phone"))
+#             patient_lang = c2.selectbox(tr("language"), ["Marathi", "Hindi", "Tamil", "Telugu", "Bengali", "English"])
+#             setup_login = st.checkbox(tr("create_login") + " (" + tr("patient_portal") + ")")
+#             asha_password = st.text_input(tr("password"), type="password") if setup_login else ""
+#             submitted = st.form_submit_button(tr("register_btn"), type="primary")
+#             if submitted:
+#                 if not name:
+#                     st.error("Name is required.")
+#                 elif setup_login and not asha_password:
+#                     st.error("Enter a password, or uncheck the app-login option.")
+#                 else:
+#                     abha_id = gen_abha_id()
+#                     pwd_hash, salt = (hash_password(asha_password) if setup_login else (None, None))
+#                     values = (abha_id, name, age, gender, village, phone, patient_lang,
+#                               datetime.now().isoformat(), pwd_hash, salt)
+
+#                     if st.session_state.offline_mode:
+#                         queue_offline_record("patient", values)
+#                         st.info(f"💾 {tr('saved_offline')} ABHA-linked ID: **{abha_id}**")
+#                     else:
+#                         conn = get_conn()
+#                         conn.execute(
+#                             "INSERT INTO patients (abha_id, name, age, gender, village, phone, language, created_at, password_hash, salt) VALUES (?,?,?,?,?,?,?,?,?,?)",
+#                             values,
+#                         )
+#                         conn.commit()
+#                         conn.close()
+#                         st.success(f"✅ Patient registered! ABHA-linked ID: **{abha_id}**")
+#                         maybe_render_qr(abha_id, caption="Patient ABHA-linked ID")
+
+#                     if setup_login:
+#                         st.info(f"Patient can now log in from the Patient Portal using phone **{phone}** and the password you set (after sync, if offline).")
+
+#         st.divider()
+#         st.subheader("Registered Patients")
+#         patients_df = df("SELECT abha_id, name, age, gender, village, language FROM patients ORDER BY created_at DESC")
+#         st.dataframe(patients_df, use_container_width=True, hide_index=True)
+#         if st.session_state.offline_queue:
+#             offline_patient_count = sum(1 for i in st.session_state.offline_queue if i["type"] == "patient")
+#             if offline_patient_count:
+#                 st.caption(f"➕ {offline_patient_count} more patient(s) saved offline, not yet synced/visible here.")
+
+#     with tab2:
+#         patients_df = df("SELECT abha_id, name FROM patients ORDER BY created_at DESC")
+#         offline_options = get_offline_patient_options()
+
+#         options = {f"{r['name']} ({r['abha_id']})": r["abha_id"] for _, r in patients_df.iterrows()}
+#         options.update(offline_options)  # include not-yet-synced patients too
+
+#         if not options:
+#             st.info("Register a patient first in the previous tab.")
+#         else:
+#             selected = st.selectbox("Select Patient", list(options.keys()))
+#             abha_id = options[selected]
+
+#             symptoms = st.text_area(
+#                 tr("symptoms"),
+#                 placeholder="e.g. High fever for 3 days with breathlessness / बुखार और सांस लेने में तकलीफ",
+#                 height=100,
+#             )
+
+#             with st.expander("🩺 " + tr("vitals_section")):
+#                 st.caption(tr("vitals_hint"))
+#                 v1, v2, v3, v4, v5 = st.columns(5)
+#                 temp_f = v1.number_input(tr("temp_label"), min_value=0.0, max_value=112.0, value=0.0, step=0.1)
+#                 spo2 = v2.number_input(tr("spo2_label"), min_value=0, max_value=100, value=0, step=1)
+#                 pulse = v3.number_input(tr("pulse_label"), min_value=0, max_value=220, value=0, step=1)
+#                 bp_sys = v4.number_input(tr("bp_sys_label"), min_value=0, max_value=260, value=0, step=1)
+#                 bp_dia = v5.number_input(tr("bp_dia_label"), min_value=0, max_value=200, value=0, step=1)
+
+#             worker_name = st.text_input("Your name (ASHA/ANM)", value="ASHA Worker")
+
+#             if st.button("🤖 " + tr("run_triage"), type="primary"):
+#                 if not symptoms:
+#                     st.warning("Please enter symptoms.")
+#                 else:
+#                     vitals = {"temp_f": temp_f, "spo2": spo2, "pulse": pulse, "bp_sys": bp_sys, "bp_dia": bp_dia}
+#                     with st.spinner("Running AI triage..."):
+#                         priority, rationale = run_triage(symptoms, vitals=vitals)
+#                     triage_id = str(uuid.uuid4())
+#                     triage_values = (triage_id, abha_id, symptoms, priority, rationale,
+#                                       worker_name, datetime.now().isoformat())
+
+#                     if st.session_state.offline_mode:
+#                         queue_offline_record("triage", triage_values)
+#                         st.info(f"💾 {tr('saved_offline')}")
+#                     else:
+#                         conn = get_conn()
+#                         conn.execute("INSERT INTO triage VALUES (?,?,?,?,?,?,?)", triage_values)
+#                         conn.commit()
+#                         conn.close()
+
+#                     st.session_state["last_triage_id"] = triage_id
+#                     st.session_state["last_triage_priority"] = priority
+#                     st.markdown(f"### {tr('priority')}: {priority_badge(priority)}", unsafe_allow_html=True)
+#                     st.write(rationale)
+
+#             last_triage_id = st.session_state.get("last_triage_id")
+#             if last_triage_id:
+#                 st.divider()
+#                 priority = st.session_state.get("last_triage_priority", "GREEN")
+#                 if priority in ("RED", "YELLOW"):
+#                     st.warning("⚠️ This patient needs facility follow-up.")
+
+#                     if priority == "RED":
+#                         if st.button(tr("trigger_sos_btn"), type="primary"):
+#                             lookup = df("SELECT name, village FROM patients WHERE abha_id=?", (abha_id,))
+#                             p_name = lookup.iloc[0]["name"] if not lookup.empty else selected.split(" (")[0]
+#                             p_village = lookup.iloc[0]["village"] if not lookup.empty else "Unknown (offline)"
+#                             conn = get_conn()
+#                             conn.execute(
+#                                 "INSERT INTO emergency_alerts VALUES (?,?,?,?,?,?,?,?)",
+#                                 (str(uuid.uuid4()), abha_id, p_name, p_village, f"ASHA: {worker_name}",
+#                                  "ACTIVE", datetime.now().isoformat(), None),
+#                             )
+#                             conn.commit()
+#                             conn.close()
+#                             st.error(tr("sos_logged"))
+
+#                     facility = st.selectbox(tr("select_facility"), FACILITIES)
+#                     if st.button("🚑 " + tr("refer_btn"), type="primary"):
+#                         ref_id = str(uuid.uuid4())
+#                         referral_values = (
+#                             ref_id, abha_id, last_triage_id, facility, "PENDING",
+#                             "", "", datetime.now().isoformat(), None, None, None,
+#                         )
+
+#                         if st.session_state.offline_mode:
+#                             queue_offline_record("referral", referral_values)
+#                             st.info(f"💾 {tr('saved_offline')} Referral queued for {facility}.")
+#                         else:
+#                             conn = get_conn()
+#                             conn.execute(
+#                                 "INSERT INTO referrals VALUES (?,?,?,?,?,?,?,?,?,?,?)", referral_values
+#                             )
+#                             conn.commit()
+#                             conn.close()
+#                             st.success(f"Referral sent to {facility} — status: PENDING (awaiting facility acknowledgment).")
+
+#                         del st.session_state["last_triage_id"]
+#                 else:
+#                     st.info("GREEN priority — routine care, no referral needed.")
+
+# # ---------------------------------------------------------------------------
+# # PAGE: DOCTOR / FACILITY DASHBOARD
+# # ---------------------------------------------------------------------------
+# elif page == tr("doctor"):
+#     if not require_pin("doctor", tr("doctor")):
+#         st.stop()
+
+#     facility = st.selectbox("Facility", FACILITIES)
+#     doctor_name = st.text_input(tr("doctor_name_label"), value="Duty Doctor")
+#     name_filter = st.text_input("🔎 " + tr("search_patient"), value="")
+
+#     q = """
+#     SELECT r.id as ref_id, p.abha_id, p.name, p.age, p.gender, p.village,
+#            t.symptoms_text, t.priority, t.rationale, t.created_by,
+#            r.status, r.created_at, r.acknowledged_at, r.acknowledged_by
+#     FROM referrals r
+#     JOIN patients p ON p.abha_id = r.abha_id
+#     JOIN triage t ON t.id = r.triage_id
+#     WHERE r.facility = ? AND r.status != 'COMPLETED'
+#     """
+#     queue = df(q, (facility,))
+#     if name_filter and not queue.empty:
+#         queue = queue[queue["name"].str.contains(name_filter, case=False, na=False)]
+
+#     st.subheader(f"📋 {tr('queue')} — {facility}")
+#     if queue.empty:
+#         st.info(tr("no_referrals"))
+#     else:
+#         queue["prio_sort"] = queue["priority"].map(PRIORITY_ORDER)
+#         queue["status_sort"] = queue["status"].map(STATUS_ORDER)
+#         queue = queue.sort_values(["status_sort", "prio_sort"])
+
+#         for _, row in queue.iterrows():
+#             with st.expander(
+#                 f"{row['name']} · {row['age']}y {row['gender']} · {row['priority']} · {row['status']}",
+#                 expanded=(row["status"] == "PENDING"),
+#             ):
+#                 badge_row = f"{priority_badge(row['priority'])} &nbsp; {status_badge(row['status'])}"
+#                 st.markdown(badge_row, unsafe_allow_html=True)
+#                 st.write(f"**ABHA ID:** {row['abha_id']}  |  **Village:** {row['village']}")
+#                 st.write(f"**Symptoms (from ASHA {row['created_by']}):** {row['symptoms_text']}")
+#                 st.caption(f"AI rationale: {row['rationale']}")
+#                 st.caption(f"Referred on: {row['created_at']}")
+
+#                 if row["status"] == "PENDING":
+#                     # --- Closed-loop referral: Step 1, receiving facility confirms arrival ---
+#                     st.warning("🚦 " + tr("awaiting_arrival"))
+#                     if st.button(tr("acknowledge_btn"), key=f"ack_{row['ref_id']}", type="primary"):
+#                         conn = get_conn()
+#                         conn.execute(
+#                             "UPDATE referrals SET status='ACKNOWLEDGED', acknowledged_at=?, acknowledged_by=? WHERE id=?",
+#                             (datetime.now().isoformat(), doctor_name, row["ref_id"]),
+#                         )
+#                         conn.commit()
+#                         conn.close()
+#                         st.success("Patient arrival acknowledged — referral is now closed-loop confirmed.")
+#                         st.rerun()
+
+#                 elif row["status"] == "ACKNOWLEDGED":
+#                     # --- Closed-loop referral: Step 2, doctor consults + completes ---
+#                     st.success(f"✅ {tr('acknowledged_on')} {row['acknowledged_at']} ({tr('acknowledged_by')}: {row['acknowledged_by']})")
+
+#                     colA, colB = st.columns(2)
+#                     with colA:
+#                         if st.button("📹 " + tr("teleconsult"), key=f"tc_{row['ref_id']}"):
+#                             st.info("🔴 Live WebRTC teleconsultation would launch here (Daily.co room).")
+#                     with colB:
+#                         st.write(f"Status: `{row['status']}`")
+
+#                     prescription = st.text_area(tr("prescription"), key=f"presc_{row['ref_id']}")
+#                     notes = st.text_input("Doctor notes", key=f"notes_{row['ref_id']}")
+#                     if st.button(tr("save_prescription"), key=f"save_{row['ref_id']}", type="primary"):
+#                         completed_at = datetime.now().isoformat()
+#                         conn = get_conn()
+#                         conn.execute(
+#                             "UPDATE referrals SET status='COMPLETED', prescription=?, doctor_notes=?, completed_at=? WHERE id=?",
+#                             (prescription, notes, completed_at, row["ref_id"]),
+#                         )
+#                         conn.commit()
+#                         conn.close()
+#                         st.success("Referral completed & prescription saved. Patient record updated.")
+#                         text = build_prescription_text(
+#                             row["name"], row["abha_id"], facility, row["priority"],
+#                             row["symptoms_text"], prescription, notes, doctor_name, completed_at,
+#                         )
+#                         st.download_button(
+#                             tr("download_prescription"), data=text,
+#                             file_name=f"prescription_{row['abha_id']}.txt", key=f"dl_{row['ref_id']}",
+#                         )
+
+#     st.divider()
+#     st.subheader("Completed Referrals (History)")
+#     hist = df(
+#         """SELECT p.name, t.priority, r.acknowledged_at, r.prescription, r.completed_at
+#            FROM referrals r JOIN patients p ON p.abha_id=r.abha_id
+#            JOIN triage t ON t.id=r.triage_id
+#            WHERE r.facility=? AND r.status='COMPLETED' ORDER BY r.completed_at DESC""",
+#         (facility,),
+#     )
+#     st.dataframe(hist, use_container_width=True, hide_index=True)
+
+# # ---------------------------------------------------------------------------
+# # PAGE: DISTRICT ADMIN DASHBOARD
+# # ---------------------------------------------------------------------------
+# elif page == tr("admin"):
+#     if not require_pin("admin", tr("admin")):
+#         st.stop()
+
+#     # --- Active emergency alerts (top of dashboard, highest visibility) ---
+#     st.subheader(tr("active_alerts"))
+#     active_alerts = df(
+#         "SELECT id, patient_name, village, triggered_by, created_at FROM emergency_alerts "
+#         "WHERE status='ACTIVE' ORDER BY created_at DESC"
+#     )
+#     if active_alerts.empty:
+#         st.success(tr("no_active_alerts"))
+#     else:
+#         for _, a in active_alerts.iterrows():
+#             ac1, ac2 = st.columns([5, 1])
+#             ac1.error(
+#                 f"🚨 **{a['patient_name']}** ({a['village']}) — reported by *{a['triggered_by']}* "
+#                 f"at {a['created_at']}"
+#             )
+#             if ac2.button(tr("resolve_btn"), key=f"resolve_{a['id']}"):
+#                 conn = get_conn()
+#                 conn.execute(
+#                     "UPDATE emergency_alerts SET status='RESOLVED', resolved_at=? WHERE id=?",
+#                     (datetime.now().isoformat(), a["id"]),
+#                 )
+#                 conn.commit()
+#                 conn.close()
+#                 st.rerun()
+
+#     st.divider()
+#     total_patients = df("SELECT COUNT(*) as n FROM patients")["n"][0]
+#     total_triage = df("SELECT COUNT(*) as n FROM triage")["n"][0]
+#     total_referrals = df("SELECT COUNT(*) as n FROM referrals")["n"][0]
+#     completed = df("SELECT COUNT(*) as n FROM referrals WHERE status='COMPLETED'")["n"][0]
+#     completion_rate = (completed / total_referrals * 100) if total_referrals else 0
+
+#     c1, c2, c3, c4 = st.columns(4)
+#     c1.metric("Registered Patients", total_patients)
+#     c2.metric("Triage Runs", total_triage)
+#     c3.metric("Referrals", total_referrals)
+#     c4.metric("Referral Completion Rate", f"{completion_rate:.0f}%")
+
+#     st.divider()
+#     st.subheader("🔗 " + tr("referral_funnel"))
+#     pending_n = df("SELECT COUNT(*) as n FROM referrals WHERE status='PENDING'")["n"][0]
+#     ack_n = df("SELECT COUNT(*) as n FROM referrals WHERE status='ACKNOWLEDGED'")["n"][0]
+#     completed_n = completed
+
+#     f1, f2, f3 = st.columns(3)
+#     f1.metric("🟠 " + tr("status_pending"), pending_n)
+#     f2.metric("🔵 " + tr("status_ack"), ack_n)
+#     f3.metric("🟢 " + tr("status_completed"), completed_n)
+
+#     funnel_df = pd.DataFrame(
+#         {"Status": ["PENDING", "ACKNOWLEDGED", "COMPLETED"], "Count": [pending_n, ack_n, completed_n]}
+#     )
+#     st.bar_chart(funnel_df.set_index("Status"))
+#     st.caption(
+#         "This funnel is the proof of the closed-loop referral USP: every referral is tracked from "
+#         "creation through facility acknowledgment to completion — no patient silently drops out."
+#     )
+
+#     # --- Referral turnaround analytics ---
+#     st.divider()
+#     st.subheader(tr("turnaround_section"))
+#     ref_times = df(
+#         "SELECT facility, created_at, acknowledged_at, completed_at FROM referrals WHERE status='COMPLETED'"
+#     )
+#     if ref_times.empty:
+#         st.info("No completed referrals yet — turnaround analytics will appear once a referral is fully closed.")
+#     else:
+#         ref_times["created_at"] = pd.to_datetime(ref_times["created_at"])
+#         ref_times["acknowledged_at"] = pd.to_datetime(ref_times["acknowledged_at"])
+#         ref_times["completed_at"] = pd.to_datetime(ref_times["completed_at"])
+#         ref_times["hrs_to_ack"] = (ref_times["acknowledged_at"] - ref_times["created_at"]).dt.total_seconds() / 3600
+#         ref_times["hrs_ack_to_complete"] = (ref_times["completed_at"] - ref_times["acknowledged_at"]).dt.total_seconds() / 3600
+
+#         t1, t2 = st.columns(2)
+#         t1.metric("Avg. time to facility acknowledgment", f"{ref_times['hrs_to_ack'].mean():.1f} hrs")
+#         t2.metric("Avg. time from arrival to prescription", f"{ref_times['hrs_ack_to_complete'].mean():.1f} hrs")
+
+#         by_facility = ref_times.groupby("facility")[["hrs_to_ack", "hrs_ack_to_complete"]].mean()
+#         st.bar_chart(by_facility)
+
+#     # --- Village outbreak signal detection ---
+#     st.divider()
+#     st.subheader(tr("outbreak_section"))
+#     recent_triage = df(
+#         "SELECT t.priority, t.created_at, p.village FROM triage t JOIN patients p ON p.abha_id = t.abha_id"
+#     )
+#     if recent_triage.empty:
+#         st.info(tr("no_outbreak"))
+#     else:
+#         recent_triage["created_at"] = pd.to_datetime(recent_triage["created_at"], errors="coerce")
+#         cutoff = datetime.now() - timedelta(days=OUTBREAK_LOOKBACK_DAYS)
+#         recent_triage = recent_triage[recent_triage["created_at"] >= cutoff]
+#         risky = recent_triage[recent_triage["priority"].isin(["RED", "YELLOW"])]
+#         clusters = (
+#             risky.groupby("village").size().reset_index(name="risk_case_count")
+#             .sort_values("risk_case_count", ascending=False)
+#         )
+#         clusters = clusters[clusters["risk_case_count"] >= OUTBREAK_CLUSTER_THRESHOLD]
+#         if clusters.empty:
+#             st.success(tr("no_outbreak"))
+#         else:
+#             for _, row in clusters.iterrows():
+#                 st.warning(
+#                     f"⚠️ **{row['village']}**: {row['risk_case_count']} RED/YELLOW triage cases "
+#                     f"in the last {OUTBREAK_LOOKBACK_DAYS} days — consider a targeted health camp / supply check."
+#                 )
+#             st.bar_chart(clusters.set_index("village"))
+
+#     st.divider()
+#     col1, col2 = st.columns(2)
+
+#     with col1:
+#         st.subheader("Triage Priority Breakdown")
+#         pr = df("SELECT priority, COUNT(*) as n FROM triage GROUP BY priority")
+#         if not pr.empty:
+#             st.bar_chart(pr.set_index("priority"))
+#         else:
+#             st.info("No triage data yet.")
+
+#     with col2:
+#         st.subheader("Referrals by Facility")
+#         rf = df("SELECT facility, COUNT(*) as n FROM referrals GROUP BY facility")
+#         if not rf.empty:
+#             st.bar_chart(rf.set_index("facility"))
+#         else:
+#             st.info("No referral data yet.")
+
+#     st.divider()
+#     st.subheader("🚨 Disease / Symptom Outbreak Signal (last entries)")
+#     recent = df("SELECT symptoms_text, priority, created_at FROM triage ORDER BY created_at DESC LIMIT 15")
+#     st.dataframe(recent, use_container_width=True, hide_index=True)
+
+#     st.divider()
+#     st.subheader("💊 Low Medicine Stock Alerts (below 10 units)")
+#     low_stock = df("SELECT facility, medicine_name, quantity, unit FROM medicine_stock WHERE quantity < 10 ORDER BY quantity ASC")
+#     if low_stock.empty:
+#         st.success("No low-stock alerts.")
+#     else:
+#         st.dataframe(low_stock, use_container_width=True, hide_index=True)
+
+#     # --- CSV data export ---
+#     st.divider()
+#     st.subheader("📤 Data Export")
+#     exp1, exp2, exp3 = st.columns(3)
+#     all_patients = df("SELECT * FROM patients")
+#     all_triage = df("SELECT * FROM triage")
+#     all_referrals = df("SELECT * FROM referrals")
+#     exp1.download_button(tr("download_csv") + " — Patients", all_patients.to_csv(index=False),
+#                           file_name="patients_export.csv")
+#     exp2.download_button(tr("download_csv") + " — Triage", all_triage.to_csv(index=False),
+#                           file_name="triage_export.csv")
+#     exp3.download_button(tr("download_csv") + " — Referrals", all_referrals.to_csv(index=False),
+#                           file_name="referrals_export.csv")
+
+# # ---------------------------------------------------------------------------
+# # PAGE: MEDICINE STOCK CHECKER
+# # ---------------------------------------------------------------------------
+# elif page == tr("medicine"):
+#     st.subheader("💊 " + tr("medicine"))
+#     facility = st.selectbox("Facility", ["All"] + FACILITIES)
+#     search = st.text_input("Search medicine name")
+
+#     query = "SELECT facility, medicine_name, quantity, unit, last_updated FROM medicine_stock WHERE 1=1"
+#     params = []
+#     if facility != "All":
+#         query += " AND facility = ?"
+#         params.append(facility)
+#     if search:
+#         query += " AND medicine_name LIKE ?"
+#         params.append(f"%{search}%")
+#     query += " ORDER BY facility, medicine_name"
+
+#     stock_df = df(query, tuple(params))
+
+#     def highlight_low(row):
+#         if row["quantity"] < 10:
+#             return ["background-color:#ffcdd2;color:black" for _ in row]
+#         return ["color:white" for _ in row]
+
+#     if stock_df.empty:
+#         st.info("No matching medicine records.")
+#     else:
+#         st.dataframe(stock_df.style.apply(highlight_low, axis=1), use_container_width=True, hide_index=True)
+#         st.caption("🔴 Highlighted rows = low stock (below 10 units) — flagged for supply chain restock.")
+#         st.download_button(tr("download_csv"), stock_df.to_csv(index=False), file_name="medicine_stock_export.csv")
+
+#     st.divider()
+#     st.subheader("📦 Restock / Update Inventory")
+#     update_tab, add_tab = st.tabs(["Update existing stock", "Add new medicine"])
+
+#     with update_tab:
+#         all_meds = df("SELECT id, facility, medicine_name, quantity, unit FROM medicine_stock ORDER BY facility, medicine_name")
+#         if all_meds.empty:
+#             st.info("No medicines in inventory yet — add one in the next tab.")
+#         else:
+#             labels = {
+#                 f"{r['medicine_name']} — {r['facility']} (current: {r['quantity']} {r['unit']})": r["id"]
+#                 for _, r in all_meds.iterrows()
+#             }
+#             chosen_label = st.selectbox("Select medicine", list(labels.keys()))
+#             chosen_id = labels[chosen_label]
+
+#             mode = st.radio("Action", ["Add stock (restock delivery)", "Remove stock (dispensed/damaged)", "Set exact quantity"], horizontal=False)
+#             amount = st.number_input("Amount", min_value=0, value=10, step=1)
+
+#             if st.button("✅ Apply Update", type="primary"):
+#                 conn = get_conn()
+#                 cur_qty = conn.execute("SELECT quantity FROM medicine_stock WHERE id=?", (chosen_id,)).fetchone()[0]
+#                 if mode.startswith("Add"):
+#                     new_qty = cur_qty + amount
+#                 elif mode.startswith("Remove"):
+#                     new_qty = max(0, cur_qty - amount)
+#                 else:
+#                     new_qty = amount
+#                 conn.execute(
+#                     "UPDATE medicine_stock SET quantity=?, last_updated=? WHERE id=?",
+#                     (new_qty, datetime.now().isoformat(), chosen_id),
+#                 )
+#                 conn.commit()
+#                 conn.close()
+#                 st.success(f"Updated — new quantity: {new_qty}")
+#                 st.rerun()
+
+#     with add_tab:
+#         with st.form("add_medicine_form"):
+#             new_facility = st.selectbox("Facility", FACILITIES, key="new_med_facility")
+#             new_name = st.text_input("Medicine name")
+#             new_qty = st.number_input("Starting quantity", min_value=0, value=50, step=1)
+#             new_unit = st.selectbox("Unit", ["tablets", "capsules", "vials", "sachets", "units", "bottles"])
+#             add_submitted = st.form_submit_button("➕ Add Medicine", type="primary")
+#             if add_submitted:
+#                 if not new_name:
+#                     st.error("Medicine name is required.")
+#                 else:
+#                     conn = get_conn()
+#                     conn.execute(
+#                         "INSERT INTO medicine_stock VALUES (?,?,?,?,?,?)",
+#                         (str(uuid.uuid4()), new_facility, new_name, new_qty, new_unit, datetime.now().isoformat()),
+#                     )
+#                     conn.commit()
+#                     conn.close()
+#                     st.success(f"Added {new_name} ({new_qty} {new_unit}) to {new_facility}.")
+#                     st.rerun()
