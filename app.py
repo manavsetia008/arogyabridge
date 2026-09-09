@@ -9,10 +9,11 @@ Run: pip install -r requirements.txt && streamlit run app.py
 See README2.md for the full feature list and what changed in this version.
 """
 
-import os, sqlite3, uuid, random, hashlib, secrets
+import os, sqlite3, uuid, random, hashlib, secrets, json
 from datetime import datetime, timedelta
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 # ─────────────────────────── CONFIG ────────────────────────────
 DB_PATH = os.path.join(os.path.dirname(__file__), "sevasetu.db")
@@ -26,21 +27,90 @@ FACILITY_TYPES = ["Sub-Centre", "Primary Health Centre (PHC)", "Rural / District
 SPECIALITIES = ["General Medicine", "Cardiology", "Pediatrics", "Obstetrics & Gynaecology",
                 "Pulmonology", "Neurology", "Orthopedics", "Gastroenterology"]
 
-st.set_page_config(page_title="ArogyaBridge", page_icon=None,
+DEFAULT_DIAGNOSTIC_TESTS = ["Blood Sugar (RBS/FBS)", "Complete Blood Count (CBC)",
+    "Malaria Rapid Test", "Dengue Rapid Test", "Urine Routine", "X-Ray",
+    "ECG", "Hemoglobin Test", "COVID-19 RAT"]
+
+# Standard child immunization schedule (days after birth -> vaccine). A simplified
+# version of the Govt. of India Universal Immunization Programme schedule.
+IMMUNIZATION_SCHEDULE = [
+    (0,"BCG"), (0,"OPV-0"), (0,"Hepatitis B - Birth Dose"),
+    (42,"OPV-1 / Pentavalent-1"), (70,"OPV-2 / Pentavalent-2"),
+    (98,"OPV-3 / Pentavalent-3"), (270,"Measles-Rubella (MR)-1"),
+    (365,"Vitamin A (1st dose)"), (456,"MR-2 / DPT Booster-1"),
+    (1825,"DPT Booster-2"),
+]
+
+CHRONIC_CONDITIONS = ["Diabetes","Hypertension","Asthma / COPD","Tuberculosis (DOTS)",
+                       "Chronic Kidney Disease","Epilepsy","Thyroid Disorder","Other Chronic Condition"]
+
+# Referral acknowledgment SLA targets used for quality monitoring (hours).
+SLA_TARGET_HOURS = {"RED":2,"YELLOW":24,"GREEN":72}
+
+st.set_page_config(page_title="ArogyaBridge", page_icon="🩺",
                    layout="wide", initial_sidebar_state="expanded")
 
 st.markdown("""
 <style>
-html,body,[class*="css"]{font-size:16px}
-.stButton>button{padding:.55rem 1.3rem;font-size:1.05rem;font-weight:600;
-  border-radius:10px;min-height:2.9rem}
+@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@500;600;700&family=Inter:wght@400;500;600&display=swap');
+
+:root{
+  --ab-primary:#0d6e6e; --ab-primary-dark:#095151; --ab-accent:#16a3a3;
+  --ab-bg:#f4f8f8; --ab-card:#ffffff; --ab-red:#e53935; --ab-yellow:#f5a623; --ab-green:#2e9e5b;
+}
+html,body,[class*="css"]{font-size:16px;font-family:'Inter',sans-serif}
+h1,h2,h3,h4{font-family:'Poppins',sans-serif !important}
+
+/* App background */
+[data-testid="stAppViewContainer"]{background:var(--ab-bg)}
+[data-testid="stHeader"]{background:transparent}
+
+/* Sidebar */
+[data-testid="stSidebar"]{
+  background:linear-gradient(180deg,var(--ab-primary) 0%,var(--ab-primary-dark) 100%);
+}
+[data-testid="stSidebar"] *{color:#eafaf7 !important}
+[data-testid="stSidebar"] .stCaption, [data-testid="stSidebar"] small{color:#bfe6e0 !important}
+[data-testid="stSidebar"] hr{border-color:rgba(255,255,255,.18)}
+[data-testid="stSidebar"] [data-testid="stSelectbox"] div[data-baseweb="select"]{
+  background:rgba(255,255,255,.12);border-radius:8px}
+[data-testid="stSidebar"] .stRadio>div{gap:.15rem}
+[data-testid="stSidebar"] .stRadio label{
+  padding:.5rem .7rem;border-radius:10px;transition:background .15s;font-weight:500}
+[data-testid="stSidebar"] .stRadio label:hover{background:rgba(255,255,255,.10)}
+
+/* Title banner */
+.ab-hero{background:linear-gradient(90deg,var(--ab-primary) 0%,var(--ab-accent) 100%);
+  color:white;border-radius:16px;padding:1.1rem 1.6rem;margin-bottom:1.1rem;
+  box-shadow:0 4px 14px rgba(13,110,110,.18)}
+.ab-hero h1{color:white !important;margin:0;font-size:1.55rem}
+.ab-hero p{margin:.15rem 0 0 0;opacity:.92;font-size:.92rem}
+
+/* Buttons */
+.stButton>button{padding:.55rem 1.3rem;font-size:1rem;font-weight:600;
+  border-radius:10px;min-height:2.8rem;border:1px solid rgba(0,0,0,.06)}
+.stButton>button[kind="primary"]{background:var(--ab-primary);border-color:var(--ab-primary)}
+.stButton>button[kind="primary"]:hover{background:var(--ab-primary-dark)}
+.stDownloadButton>button{border-radius:10px;font-weight:600}
+
+/* Inputs */
 .stTextInput input,.stNumberInput input,.stTextArea textarea{
-  font-size:1.05rem;padding:.55rem .7rem}
-.stSelectbox>div>div{min-height:2.9rem;font-size:1.05rem}
-.stTabs [data-baseweb="tab"]{font-size:1rem;font-weight:600;padding:.45rem .9rem}
+  font-size:1rem;padding:.55rem .7rem;border-radius:8px}
+.stSelectbox>div>div{min-height:2.8rem;font-size:1rem;border-radius:8px}
+
+/* Tabs — pill style */
+.stTabs [data-baseweb="tab-list"]{gap:.25rem}
+.stTabs [data-baseweb="tab"]{font-size:.95rem;font-weight:600;padding:.5rem 1rem;
+  border-radius:8px 8px 0 0;background:#eef4f4}
+.stTabs [aria-selected="true"]{background:var(--ab-primary) !important;color:white !important}
+
 .stRadio>div{gap:.35rem}.stRadio label{font-size:1.05rem}
-[data-testid="stMetricValue"]{font-size:1.55rem}
-[data-testid="stMetricLabel"]{font-size:.9rem}
+[data-testid="stMetricValue"]{font-size:1.5rem;color:var(--ab-primary-dark)}
+[data-testid="stMetricLabel"]{font-size:.85rem;font-weight:600;color:#5a6b6b}
+
+/* Bordered containers -> soft cards */
+div[data-testid="stVerticalBlockBorderWrapper"]{
+  border-radius:14px !important;box-shadow:0 2px 8px rgba(20,60,60,.06)}
 </style>""", unsafe_allow_html=True)
 
 # ─────────────────────────── I18N ──────────────────────────────
@@ -68,6 +138,11 @@ T = {
   "register_patient":"Register New Patient",
   "my_patients":"My Registered Patients","all_patients":"All Registered Patients",
   "update_details":"Update My Details",
+  "diagnostics":"Diagnostic Availability","specialists":"Find a Specialist",
+  "scheme_eligible":"PM-JAY / Ayushman Bharat Eligible",
+  "export_record":"Export My Health Record",
+  "listen":"Listen to result",
+  "public_services":"Other Services (no login needed)",
 },
 "hi": {
   "app_title":"ArogyaBridge — स्वास्थ्य सेवा का पुल","role":"अपनी भूमिका चुनें",
@@ -90,6 +165,8 @@ T = {
   "no_records_yet":"अभी कोई रिकॉर्ड नहीं।","create_login":"अपना लॉगिन बनाएं",
   "phone_login_hint":"अपने आधार आईडी से लॉगिन करें।",
   "register_patient":"नया रोगी पंजीकृत करें",
+  "diagnostics":"निदान उपलब्धता","specialists":"विशेषज्ञ खोजें",
+  "public_services":"अन्य सेवाएँ (लॉगिन आवश्यक नहीं)",
 },
 "mr": {
   "app_title":"ArogyaBridge — आरोग्यसेवेचा पूल","role":"तुमची भूमिका निवडा",
@@ -111,6 +188,8 @@ T = {
   "my_triage_history":"माझा लक्षण इतिहास","my_referrals":"माझे संदर्भ",
   "no_records_yet":"अजून नोंद नाही.","create_login":"लॉगिन तयार करा",
   "phone_login_hint":"तुमच्या आधार आयडीने लॉगिन करा.","register_patient":"नवीन रुग्ण नोंदणी",
+  "diagnostics":"निदान उपलब्धता","specialists":"तज्ञ शोधा",
+  "public_services":"इतर सेवा (लॉगिन आवश्यक नाही)",
 },
 "ta": {
   "app_title":"ArogyaBridge — சுகாதார சேவைக்கான பாலம்","role":"பாத்திரம் தேர்வு",
@@ -132,6 +211,8 @@ T = {
   "my_triage_history":"அறிகுறி வரலாறு","my_referrals":"பரிந்துரைகள்",
   "no_records_yet":"பதிவுகள் இல்லை.","create_login":"லாக்இன் உருவாக்கவும்",
   "phone_login_hint":"உங்கள் ஆதார் ஐடியுடன் உள்நுழையவும்.","register_patient":"நோயாளர் பதிவு",
+  "diagnostics":"நோய்க் கண்டறிதல் கிடைக்கும் தன்மை","specialists":"நிபுணரைத் தேடுங்கள்",
+  "public_services":"பிற சேவைகள் (உள்நுழைவு தேவையில்லை)",
 },
 "te": {
   "app_title":"ArogyaBridge — ఆరోగ్య సేవకు వంతెన","role":"పాత్ర ఎంచుకోండి",
@@ -153,6 +234,8 @@ T = {
   "my_triage_history":"లక్షణాల చరిత్ర","my_referrals":"రిఫరల్స్",
   "no_records_yet":"రికార్డులు లేవు.","create_login":"లాగిన్ సృష్టించండి",
   "phone_login_hint":"మీ ఆధార్ ఐడితో లాగిన్ అవ్వండి.","register_patient":"రోగి నమోదు",
+  "diagnostics":"నిర్ధారణ పరీక్షల లభ్యత","specialists":"నిపుణుడిని కనుగొనండి",
+  "public_services":"ఇతర సేవలు (లాగిన్ అవసరం లేదు)",
 },
 "bn": {
   "app_title":"ArogyaBridge — স্বাস্থ্যসেবার সেতু","role":"ভূমিকা নির্বাচন",
@@ -174,6 +257,8 @@ T = {
   "my_triage_history":"লক্ষণ ইতিহাস","my_referrals":"রেফারেল",
   "no_records_yet":"রেকর্ড নেই।","create_login":"লগইন তৈরি করুন",
   "phone_login_hint":"আপনার আধার আইডি দিয়ে লগইন করুন।","register_patient":"রোগী নিবন্ধন",
+  "diagnostics":"নির্ণয় পরীক্ষার প্রাপ্যতা","specialists":"বিশেষজ্ঞ খুঁজুন",
+  "public_services":"অন্যান্য সেবা (লগইন প্রয়োজন নেই)",
 },
 }
 
@@ -212,7 +297,8 @@ def init_db():
     CREATE TABLE IF NOT EXISTS referrals(
       id TEXT PRIMARY KEY, abha_id TEXT, triage_id TEXT, facility TEXT,
       status TEXT, prescription TEXT, doctor_notes TEXT,
-      created_at TEXT, completed_at TEXT, doctor_id TEXT);
+      created_at TEXT, completed_at TEXT, doctor_id TEXT,
+      acknowledged_at TEXT, acknowledged_by TEXT, escalated_from TEXT, escalated_to TEXT);
     CREATE TABLE IF NOT EXISTS notifications(
       id TEXT PRIMARY KEY, recipient_role TEXT, recipient_id TEXT,
       message TEXT, priority TEXT, read INTEGER DEFAULT 0, created_at TEXT,
@@ -233,6 +319,29 @@ def init_db():
       id TEXT PRIMARY KEY, facility_id TEXT, facility TEXT, medicine_name TEXT,
       action TEXT, change_amount INTEGER, new_quantity INTEGER,
       changed_by TEXT, changed_at TEXT);
+    CREATE TABLE IF NOT EXISTS diagnostic_tests(
+      id TEXT PRIMARY KEY, facility_id TEXT, facility TEXT, test_name TEXT,
+      available INTEGER DEFAULT 1, turnaround_hours INTEGER, last_updated TEXT, updated_by TEXT);
+    CREATE TABLE IF NOT EXISTS diagnostic_orders(
+      id TEXT PRIMARY KEY, abha_id TEXT, referral_id TEXT, test_name TEXT, facility TEXT,
+      status TEXT DEFAULT 'ORDERED', result_notes TEXT, ordered_by TEXT,
+      ordered_at TEXT, completed_at TEXT);
+    CREATE TABLE IF NOT EXISTS chronic_registry(
+      id TEXT PRIMARY KEY, abha_id TEXT, condition TEXT, interval_days INTEGER,
+      next_due_date TEXT, active INTEGER DEFAULT 1, created_by TEXT, created_at TEXT,
+      last_followup_at TEXT);
+    CREATE TABLE IF NOT EXISTS mch_pregnancy(
+      id TEXT PRIMARY KEY, abha_id TEXT, lmp_date TEXT, edd TEXT,
+      anc1_done INTEGER DEFAULT 0, anc2_done INTEGER DEFAULT 0,
+      anc3_done INTEGER DEFAULT 0, anc4_done INTEGER DEFAULT 0,
+      high_risk INTEGER DEFAULT 0, status TEXT DEFAULT 'ACTIVE',
+      created_by TEXT, created_at TEXT);
+    CREATE TABLE IF NOT EXISTS mch_child(
+      id TEXT PRIMARY KEY, abha_id TEXT, child_name TEXT, dob TEXT,
+      created_by TEXT, created_at TEXT);
+    CREATE TABLE IF NOT EXISTS mch_immunization(
+      id TEXT PRIMARY KEY, child_id TEXT, abha_id TEXT, vaccine_name TEXT,
+      due_date TEXT, given INTEGER DEFAULT 0, given_date TEXT);
     """)
     conn.commit()
 
@@ -252,6 +361,12 @@ def init_db():
     add_col("patients","registered_by_id"); add_col("patients","registered_by_name")
     add_col("asha_workers","facility_id"); add_col("doctors","facility_id")
     add_col("medicine_stock","facility_id"); add_col("medicine_stock","updated_by")
+    add_col("referrals","acknowledged_at"); add_col("referrals","acknowledged_by")
+    add_col("referrals","escalated_from"); add_col("referrals","escalated_to")
+    add_col("patients","scheme_eligible","INTEGER DEFAULT 0")
+    add_col("referrals","teleconsult_notes"); add_col("referrals","teleconsult_started_at")
+    add_col("referrals","teleconsult_ended_at")
+    add_col("referrals","feedback_rating","INTEGER"); add_col("referrals","feedback_comment")
     conn.commit()
     conn.close()
 
@@ -328,6 +443,7 @@ def groq_triage(text):
             if p in PRIORITY_ORDER: return p,r.strip()
     except Exception:
         return None
+    return None
 
 def run_triage(text):
     res=groq_triage(text)
@@ -405,6 +521,135 @@ def seed_default_stock_for_facility(facility_id, facility_name):
                      (str(uuid.uuid4()), facility_id, facility_name, med, "Initial stock", qty, qty, "System", now))
     conn.commit(); conn.close()
 
+def predict_stockout(facility_id, medicine_name):
+    """Estimates days remaining before a medicine runs out, using the actual
+    consumption velocity recorded in medicine_stock_log — not just a static
+    'below 10 units' threshold. Returns None if there isn't enough history
+    yet (fewer than 2 log entries, or no depletion observed since the last
+    restock)."""
+    hist = qdf(
+        "SELECT change_amount, new_quantity, changed_at FROM medicine_stock_log "
+        "WHERE facility_id=? AND medicine_name=? ORDER BY changed_at",
+        (facility_id, medicine_name),
+    )
+    if len(hist) < 2:
+        return None
+    hist["changed_at"] = pd.to_datetime(hist["changed_at"], errors="coerce")
+    consumption = hist[hist["change_amount"] < 0]
+    if consumption.empty:
+        return None
+    total_consumed = -consumption["change_amount"].sum()
+    span_days = (hist["changed_at"].max() - hist["changed_at"].min()).total_seconds() / 86400
+    span_days = max(span_days, 1)
+    avg_daily = total_consumed / span_days
+    if avg_daily <= 0:
+        return None
+    current_qty = hist.iloc[-1]["new_quantity"]
+    return round(float(current_qty / avg_daily), 1)
+
+def seed_default_diagnostics_for_facility(facility_id, facility_name):
+    """Gives every newly registered facility a starter diagnostic-test catalog,
+    the same way seed_default_stock_for_facility does for medicines."""
+    now = datetime.now().isoformat()
+    conn = get_conn()
+    for name in DEFAULT_DIAGNOSTIC_TESTS:
+        conn.execute("INSERT INTO diagnostic_tests(id,facility_id,facility,test_name,available,turnaround_hours,last_updated,updated_by) VALUES(?,?,?,?,?,?,?,?)",
+                     (str(uuid.uuid4()), facility_id, facility_name, name, 1, 24, now, "System (initial setup)"))
+    conn.commit(); conn.close()
+
+def generate_immunization_schedule(child_id, abha_id, dob_str, created_by):
+    """Pre-computes the full due-date list for a newly registered child based
+    on the standard Govt. of India immunization schedule."""
+    try:
+        dob = datetime.strptime(dob_str, "%Y-%m-%d")
+    except Exception:
+        return
+    conn = get_conn()
+    for offset_days, vaccine in IMMUNIZATION_SCHEDULE:
+        due = (dob + timedelta(days=offset_days)).strftime("%Y-%m-%d")
+        conn.execute("INSERT INTO mch_immunization(id,child_id,abha_id,vaccine_name,due_date,given,given_date) VALUES(?,?,?,?,?,0,NULL)",
+                     (str(uuid.uuid4()), child_id, abha_id, vaccine, due))
+    conn.commit(); conn.close()
+
+def compute_sla_status(priority, created_at, acknowledged_at, status):
+    """Quality-monitoring helper: flags whether a referral's acknowledgment
+    breached its priority-based SLA target (RED=2h, YELLOW=24h, GREEN=72h)."""
+    try:
+        created = datetime.fromisoformat(created_at)
+    except Exception:
+        return None, None
+    target = SLA_TARGET_HOURS.get(priority, 72)
+    end_time = datetime.fromisoformat(acknowledged_at) if acknowledged_at else datetime.now()
+    elapsed_hours = (end_time - created).total_seconds() / 3600
+    breached = elapsed_hours > target and status == "PENDING" or (acknowledged_at and elapsed_hours > target)
+    return round(elapsed_hours, 1), bool(breached)
+
+def fhir_lite_export(abha_id):
+    """Builds a simplified, FHIR-inspired JSON bundle for a patient — an
+    ABDM-lite interoperable export so a patient's record isn't locked inside
+    this single application."""
+    conn = get_conn()
+    p = conn.execute("SELECT * FROM patients WHERE abha_id=?", (abha_id,)).fetchone()
+    if not p:
+        conn.close(); return None
+    triage_rows = conn.execute("SELECT * FROM triage WHERE abha_id=? ORDER BY created_at", (abha_id,)).fetchall()
+    referral_rows = conn.execute("SELECT * FROM referrals WHERE abha_id=? ORDER BY created_at", (abha_id,)).fetchall()
+    diag_rows = conn.execute("SELECT * FROM diagnostic_orders WHERE abha_id=? ORDER BY ordered_at", (abha_id,)).fetchall()
+    conn.close()
+    bundle = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "meta": {"profile": "ArogyaBridge-ABDM-lite-v1"},
+        "exported_at": datetime.now().isoformat(),
+        "entry": [{
+            "resourceType": "Patient",
+            "identifier": [{"system": "ABHA", "value": p["abha_id"]},
+                           {"system": "AADHAAR-MASKED", "value": mask_aadhaar(p["aadhaar_id"])}],
+            "name": p["name"], "gender": p["gender"], "age": p["age"],
+            "address": {"village": p["village"]}, "language": p["language"],
+            "schemeEligible": bool(p["scheme_eligible"]) if "scheme_eligible" in p.keys() else False,
+        }],
+        "encounters": [{
+            "resourceType": "Condition/Observation",
+            "id": t["id"], "recordedDate": t["created_at"], "priority": t["priority"],
+            "symptoms": t["symptoms_text"], "department": t["department"],
+            "rationale": t["rationale"], "vitals": {"temperature": t["temperature"],
+            "spo2": t["spo2"], "pulse": t["pulse"]},
+        } for t in triage_rows],
+        "referrals": [{
+            "resourceType": "ServiceRequest", "id": r["id"], "facility": r["facility"],
+            "status": r["status"], "createdAt": r["created_at"], "completedAt": r["completed_at"],
+            "prescription": r["prescription"], "notes": r["doctor_notes"],
+        } for r in referral_rows],
+        "diagnosticReports": [{
+            "resourceType": "DiagnosticReport", "id": d["id"], "test": d["test_name"],
+            "facility": d["facility"], "status": d["status"], "resultNotes": d["result_notes"],
+            "orderedAt": d["ordered_at"], "completedAt": d["completed_at"],
+        } for d in diag_rows],
+    }
+    return json.dumps(bundle, indent=2, default=str)
+
+def tts_component(text, lang_code="en", key="tts"):
+    """Renders a small browser-based 'listen' button using the Web Speech API
+    (SpeechSynthesis) — zero-cost, works offline once the page is loaded, and
+    supports the app's regional languages for low-literacy users."""
+    voice_lang_map = {"en":"en-IN","hi":"hi-IN","mr":"mr-IN","ta":"ta-IN","te":"te-IN","bn":"bn-IN"}
+    voice_lang = voice_lang_map.get(lang_code, "en-IN")
+    safe_text = json.dumps(text or "")
+    components.html(f"""
+    <button id="btn_{key}" style="padding:8px 16px;border-radius:8px;border:1px solid #999;
+        background:#f0f2f6;cursor:pointer;font-size:0.95rem;font-weight:600;">🔊 Listen</button>
+    <script>
+      const btn = document.getElementById("btn_{key}");
+      btn.onclick = function() {{
+        const msg = new SpeechSynthesisUtterance({safe_text});
+        msg.lang = "{voice_lang}";
+        window.speechSynthesis.cancel();
+        window.speechSynthesis.speak(msg);
+      }};
+    </script>
+    """, height=50)
+
 # ─────────────────────────── AUTH SCREENS ──────────────────────
 def patient_auth_screen():
     st.markdown(f"### {tr('patient_portal')}")
@@ -438,9 +683,11 @@ def patient_auth_screen():
                 rv=c2.text_input(tr("village"))
                 raad=c1.text_input(tr("aadhaar_id"), placeholder="12-digit Aadhaar number")
                 rph=c2.text_input(tr("phone")+" (optional)")
-                rl=c1.selectbox(tr("language"),["Marathi","Hindi","Tamil","Telugu","Bengali","English"])
-                rpw=c1.text_input(tr("password"), type="password")
-                rc=c2.text_input(tr("confirm_password"), type="password")
+                rl=st.selectbox(tr("language"),["Marathi","Hindi","Tamil","Telugu","Bengali","English"])
+                r_scheme=st.checkbox(tr("scheme_eligible"), help="Check if you hold a valid PM-JAY / Ayushman Bharat card.")
+                st.markdown("###### Set a password")
+                rpw=st.text_input(tr("password"), type="password")
+                rc=st.text_input(tr("confirm_password"), type="password")
                 submitted=st.form_submit_button(tr("register_btn"), type="primary", use_container_width=True)
                 if submitted:
                     aad_clean = (raad or "").strip().replace(" ","")
@@ -457,10 +704,10 @@ def patient_auth_screen():
                             h,s=hash_pw(rpw)
                             conn.execute("""INSERT INTO patients
                                 (abha_id,name,age,gender,village,phone,aadhaar_id,language,created_at,
-                                 password_hash,salt,registered_by_type,registered_by_id,registered_by_name)
-                                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                 password_hash,salt,registered_by_type,registered_by_id,registered_by_name,scheme_eligible)
+                                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                                 (gen_abha(),rn,ra,rg,rv,rph,aad_clean,rl,datetime.now().isoformat(),
-                                 h,s,"self",None,"Self"))
+                                 h,s,"self",None,"Self",1 if r_scheme else 0))
                             conn.commit(); conn.close()
                             st.success("Registered! Please log in above using your Aadhaar ID.")
     return None
@@ -494,8 +741,9 @@ def facility_auth_screen():
                 ft=c2.selectbox("Facility Type", FACILITY_TYPES)
                 fv=c1.text_input("Village / Area Served")
                 fph=c2.text_input(tr("phone"))
-                fpw=c1.text_input(tr("password"), type="password")
-                fc=c2.text_input(tr("confirm_password"), type="password")
+                st.markdown("###### Set a password")
+                fpw=st.text_input(tr("password"), type="password")
+                fc=st.text_input(tr("confirm_password"), type="password")
                 submitted=st.form_submit_button(tr("register_btn"), type="primary", use_container_width=True)
                 if submitted:
                     if not fn or not fph: st.error("Facility name and phone are required.")
@@ -513,6 +761,7 @@ def facility_auth_screen():
                                          (fid,fn,ft,fv,fph,h,s,datetime.now().isoformat()))
                             conn.commit(); conn.close()
                             seed_default_stock_for_facility(fid, fn)
+                            seed_default_diagnostics_for_facility(fid, fn)
                             st.success("Facility registered! Please log in above.")
     return None
 
@@ -536,6 +785,102 @@ def staff_login_screen(role_label, table, id_placeholder):
                 "from the Facility / Hospital portal.")
     return None
 
+# ─────────────────────── PUBLIC (NO LOGIN) PAGES ────────────────
+# These used to be separate items in the role selector. They are public,
+# read-only pages, so they now live as a small "Other Services" section
+# tucked under the Patient Portal (shown only before/without login) instead
+# of cluttering the main role list.
+
+def render_medicine_page():
+    st.caption("Public read-only view. To update stock levels, log in through the "
+               "Facility / Hospital portal — every change there is tied to the facility that made it.")
+    facs=["All"]+get_facility_names()
+    s1,s2=st.columns(2)
+    fac_filter=s1.selectbox("Facility",facs,key="med_fac_filter")
+    med_search=s2.text_input("Search medicine name",key="med_search")
+
+    sql="SELECT facility_id,facility,medicine_name,quantity,unit,last_updated FROM medicine_stock WHERE 1=1"
+    params=[]
+    if fac_filter!="All": sql+=" AND facility=?"; params.append(fac_filter)
+    if med_search: sql+=" AND medicine_name LIKE ?"; params.append(f"%{med_search}%")
+    sql+=" ORDER BY facility,medicine_name"
+    stock=qdf(sql,tuple(params))
+
+    def hl(row):
+        if row["quantity"]<10: return ["background-color:#ffcdd2;color:black"]*len(row)
+        return [""]*len(row)
+
+    if stock.empty: st.info("No medicines found.")
+    else:
+        stock["predicted_stockout_days"]=stock.apply(lambda r: predict_stockout(r["facility_id"], r["medicine_name"]), axis=1)
+        display_stock = stock.drop(columns=["facility_id"])
+        st.dataframe(clean_df(display_stock).style.apply(hl,axis=1),use_container_width=True,hide_index=True)
+        st.caption("Red rows = low stock (below 10 units). 'Predicted stockout days' is based on real "
+                   "consumption history at that facility, not a fixed threshold.")
+
+def render_diagnostics_page():
+    st.caption("Public read-only view — a searchable view of which facility can run which "
+               "diagnostic test. To update your facility's tests, log in through the Facility portal.")
+    facs=["All"]+get_facility_names()
+    s1,s2=st.columns(2)
+    fac_filter=s1.selectbox("Facility",facs,key="diag_fac_filter")
+    test_search=s2.text_input("Search test name",key="diag_search")
+
+    sql="SELECT facility,test_name,available,turnaround_hours,last_updated FROM diagnostic_tests WHERE 1=1"
+    params=[]
+    if fac_filter!="All": sql+=" AND facility=?"; params.append(fac_filter)
+    if test_search: sql+=" AND test_name LIKE ?"; params.append(f"%{test_search}%")
+    sql+=" ORDER BY facility,test_name"
+    tests=qdf(sql,tuple(params))
+
+    if tests.empty:
+        st.info("No diagnostic tests found.")
+    else:
+        tests["available"]=tests["available"].map({1:"Available",0:"Unavailable"})
+        st.dataframe(clean_df(tests).style.apply(lambda r: ["background-color:#ffcdd2;color:black"]*len(r) if r["available"]=="Unavailable" else [""]*len(r),axis=1),
+                     use_container_width=True,hide_index=True)
+        st.caption("Red rows = currently unavailable at that facility. Turnaround time is set by the facility.")
+
+def render_specialists_page():
+    st.caption("A public, searchable view of which facility has which speciality, so patients "
+               "and ASHA workers know where to refer before a case gets urgent.")
+    s1,s2=st.columns(2)
+    spec_filter=s1.selectbox("Speciality",["All"]+SPECIALITIES,key="spec_filter")
+    village_search=s2.text_input("Search facility or village",key="spec_village_search")
+
+    sql="""SELECT d.name as doctor_name, d.speciality, d.facility, f.type as facility_type, f.village
+           FROM doctors d LEFT JOIN facilities f ON f.name=d.facility WHERE 1=1"""
+    params=[]
+    if spec_filter!="All": sql+=" AND d.speciality=?"; params.append(spec_filter)
+    if village_search: sql+=" AND (d.facility LIKE ? OR f.village LIKE ?)"; params.append(f"%{village_search}%"); params.append(f"%{village_search}%")
+    sql+=" ORDER BY d.speciality, d.facility"
+    specialists=qdf(sql,tuple(params))
+
+    if specialists.empty:
+        st.info("No doctors match your filters yet.")
+    else:
+        st.caption(f"{len(specialists)} doctor(s) found")
+        st.dataframe(clean_df(specialists),use_container_width=True,hide_index=True)
+
+    st.divider()
+    st.markdown("**Speciality Coverage by Facility**")
+    coverage=qdf("""SELECT facility, GROUP_CONCAT(DISTINCT speciality) as specialities, COUNT(*) as doctor_count
+                    FROM doctors GROUP BY facility ORDER BY facility""")
+    if coverage.empty:
+        st.info("No facilities have doctors registered yet.")
+    else:
+        st.dataframe(clean_df(coverage),use_container_width=True,hide_index=True)
+
+def render_public_services_block():
+    """Shown only on the Patient Portal, before/without login — the three
+    public read-only lookups, tucked away so the main role list stays short."""
+    st.divider()
+    with st.expander(f"🔎 {tr('public_services')}", expanded=False):
+        pm1,pm2,pm3=st.tabs([tr("medicine"), tr("diagnostics"), tr("specialists")])
+        with pm1: render_medicine_page()
+        with pm2: render_diagnostics_page()
+        with pm3: render_specialists_page()
+
 # ─────────────────────────── INIT ──────────────────────────────
 init_db()
 if "ui_lang" not in st.session_state: st.session_state.ui_lang="en"
@@ -549,7 +894,10 @@ with st.sidebar:
     lc=st.selectbox("Language",list(LANG_LABELS.values()))
     st.session_state.ui_lang=next(k for k,v in LANG_LABELS.items() if v==lc)
     st.divider()
-    ROLES=[tr("patient_portal"),tr("asha"),tr("doctor"),tr("facility"),tr("admin"),tr("medicine")]
+    # Only the five real dashboards live in the role selector now.
+    # Medicine / Diagnostics / Find-a-Specialist are public lookups and
+    # live inside the Patient Portal (see render_public_services_block).
+    ROLES=[tr("patient_portal"),tr("asha"),tr("doctor"),tr("facility"),tr("admin")]
     page=st.radio(tr("role"),ROLES)
     st.divider()
     st.caption("AI mode: "+("Groq Llama 3.1" if GROQ_API_KEY else "Rule-based fallback"))
@@ -566,6 +914,7 @@ if page==tr("patient_portal"):
     if not st.session_state[sk]:
         row=patient_auth_screen()
         if row: st.session_state[sk]=row; st.rerun()
+        render_public_services_block()
     else:
         u=st.session_state[sk]
         abha_id=u["abha_id"]
@@ -576,13 +925,15 @@ if page==tr("patient_portal"):
             h1.markdown(f"### {tr('welcome_back')}, **{p['name'] or u['name']}**")
             if h2.button(tr("logout_btn")):
                 st.session_state[sk]=None; st.rerun()
-            mc1,mc2,mc3,mc4=st.columns(4)
+            mc1,mc2,mc3,mc4,mc5=st.columns(5)
             mc1.metric("ABHA ID",p["abha_id"])
             mc2.metric(tr("age"),int(p["age"]) if p["age"] else "—")
             mc3.metric(tr("village"),p["village"] or "—")
             mc4.metric(tr("aadhaar_id"), mask_aadhaar(p["aadhaar_id"]))
+            scheme_val = p["scheme_eligible"] if "scheme_eligible" in p.keys() else 0
+            mc5.metric("PM-JAY", "Eligible" if scheme_val else "Not linked")
 
-        qa1,qa2,qa3,qa4=st.columns(4)
+        qa1,qa2,qa3,qa4,qa5=st.columns(5)
         if qa1.button(tr("book_appointment"),use_container_width=True):
             st.session_state["show_appt"]=not st.session_state.get("show_appt",False)
             st.session_state["show_self_triage"]=False; st.session_state["show_update"]=False
@@ -592,6 +943,10 @@ if page==tr("patient_portal"):
         if qa3.button(tr("update_details"),use_container_width=True):
             st.session_state["show_update"]=not st.session_state.get("show_update",False)
             st.session_state["show_appt"]=False; st.session_state["show_self_triage"]=False
+        qa5.download_button(tr("export_record"), data=(fhir_lite_export(abha_id) or "{}"),
+                             file_name=f"{abha_id}_health_record.json", mime="application/json",
+                             use_container_width=True,
+                             help="ABDM-lite interoperable JSON export of your full health record.")
         if qa4.button(tr("sos"),type="primary",use_container_width=True):
             st.session_state["sos_armed"]=True
             st.session_state["sos_armed_at"]=datetime.now().isoformat()
@@ -775,6 +1130,7 @@ if page==tr("patient_portal"):
                         col_r.markdown(f"**Result:** {priority_badge(priority)}",unsafe_allow_html=True)
                         st.write(rationale)
                         st.info(f"Suggested department: **{dept}**")
+                        tts_component(f"{rationale}. Suggested department: {dept}.", st.session_state.get("ui_lang","en"), key=f"tts_self_{tid}")
                         if priority=="RED":
                             st.error("Emergency SOS auto-triggered. All doctors + ASHA workers alerted. Ambulance requested.")
                         elif priority=="YELLOW":
@@ -812,13 +1168,13 @@ if page==tr("patient_portal"):
         my_sos=qdf("SELECT status,triggered_at FROM sos_alerts WHERE abha_id=? AND status='ACTIVE'",(abha_id,))
         if not my_sos.empty:
             st.warning(f"{len(my_sos)} active SOS alert(s) awaiting response.")
-        my_appts=qdf("SELECT facility,appointment_date,time_slot,status FROM appointments WHERE abha_id=? ORDER BY appointment_date DESC",(abha_id,))
+        my_appts=qdf("SELECT facility,appointment_date,time_slot,status,decline_reason FROM appointments WHERE abha_id=? ORDER BY appointment_date DESC",(abha_id,))
         if not my_appts.empty:
             st.markdown("**My Appointments**")
             st.dataframe(clean_df(my_appts),use_container_width=True,hide_index=True)
 
         st.subheader(tr("my_health_record"))
-        ht1,ht2=st.tabs([tr("my_triage_history"),tr("my_referrals")])
+        ht1,ht2,ht3,ht4=st.tabs([tr("my_triage_history"),tr("my_referrals"),"Diagnostic Reports","Care Plans (MCH/Chronic)"])
         with ht1:
             th=qdf("SELECT symptoms_text,priority,department,temperature,spo2,pulse,created_at FROM triage WHERE abha_id=? ORDER BY created_at DESC",(abha_id,))
             if th.empty: st.info(tr("no_records_yet"))
@@ -835,7 +1191,7 @@ if page==tr("patient_portal"):
                             if r["spo2"]: vc2.metric("SpO₂",f"{r['spo2']}%")
                             if r["pulse"]: vc3.metric("Pulse",f"{r['pulse']} bpm")
         with ht2:
-            rh=qdf("SELECT facility,status,prescription,doctor_notes,created_at,completed_at FROM referrals WHERE abha_id=? ORDER BY created_at DESC",(abha_id,))
+            rh=qdf("SELECT id,facility,status,prescription,doctor_notes,created_at,completed_at,feedback_rating,feedback_comment FROM referrals WHERE abha_id=? ORDER BY created_at DESC",(abha_id,))
             if rh.empty: st.info(tr("no_records_yet"))
             else:
                 for _,r in rh.iterrows():
@@ -843,9 +1199,46 @@ if page==tr("patient_portal"):
                         st.write(f"**{r['facility']}** — `{r['status']}`  |  {r['created_at'][:10]}")
                         if r["prescription"]: st.write(f"**Prescription:** {r['prescription']}")
                         if r["doctor_notes"]: st.caption(f"Notes: {r['doctor_notes']}")
+                        if r["status"]=="COMPLETED":
+                            if pd.isna(r["feedback_rating"]) or r["feedback_rating"] in (None,"—"):
+                                with st.form(f"feedback_form_{r['id']}"):
+                                    st.caption("Quality check: did this visit help you?")
+                                    fb_rating=st.select_slider("Rate your experience",options=[1,2,3,4,5],value=4,key=f"fbr_{r['id']}")
+                                    fb_comment=st.text_input("Any comment (optional)",key=f"fbc_{r['id']}")
+                                    if st.form_submit_button("Submit Feedback"):
+                                        conn=get_conn()
+                                        conn.execute("UPDATE referrals SET feedback_rating=?,feedback_comment=? WHERE id=?",
+                                                     (fb_rating,fb_comment,r["id"]))
+                                        conn.commit(); conn.close()
+                                        st.success("Thank you for your feedback!"); st.rerun()
+                            else:
+                                st.caption(f"Your feedback: {'⭐'*int(r['feedback_rating'])} {r['feedback_comment'] or ''}")
+        with ht3:
+            dh=qdf("SELECT test_name,facility,status,result_notes,ordered_at,completed_at FROM diagnostic_orders WHERE abha_id=? ORDER BY ordered_at DESC",(abha_id,))
+            if dh.empty: st.info("No diagnostic tests ordered yet.")
+            else: st.dataframe(clean_df(dh),use_container_width=True,hide_index=True)
+        with ht4:
+            preg=qdf("SELECT lmp_date,edd,anc1_done,anc2_done,anc3_done,anc4_done,high_risk,status FROM mch_pregnancy WHERE abha_id=? ORDER BY created_at DESC",(abha_id,))
+            if not preg.empty:
+                st.markdown("**Pregnancy / ANC Tracker**")
+                st.dataframe(clean_df(preg),use_container_width=True,hide_index=True)
+            children=qdf("SELECT id,child_name,dob FROM mch_child WHERE abha_id=? ORDER BY created_at DESC",(abha_id,))
+            if not children.empty:
+                st.markdown("**Child Immunization**")
+                for _,ch in children.iterrows():
+                    imm=qdf("SELECT vaccine_name,due_date,given,given_date FROM mch_immunization WHERE child_id=? ORDER BY due_date",(ch["id"],))
+                    st.caption(f"{ch['child_name'] or 'Child'} — DOB {ch['dob']}")
+                    st.dataframe(clean_df(imm),use_container_width=True,hide_index=True)
+            chronic=qdf("SELECT condition,interval_days,next_due_date,active FROM chronic_registry WHERE abha_id=?",(abha_id,))
+            if not chronic.empty:
+                st.markdown("**Chronic Care Follow-up Plan**")
+                st.dataframe(clean_df(chronic),use_container_width=True,hide_index=True)
+            if preg.empty and children.empty and chronic.empty:
+                st.info("No MCH or chronic-care plans on record.")
 
 # ══════════════════════════════════════════════════════════════
-# PAGE: ASHA WORKER PORTAL
+# PAGE: ASHA WORKER PORTAL  (single, unified dashboard — everything an
+# ASHA/ANM worker needs lives in these tabs, not spread across pages)
 # ══════════════════════════════════════════════════════════════
 elif page==tr("asha"):
     sk="asha_user"
@@ -870,11 +1263,13 @@ elif page==tr("asha"):
                 if st.button("Mark all read",key="asha_mark_read"):
                     mark_read("asha",u["id"]); st.rerun()
 
-        tab1,tab2,tab3,tab4=st.tabs([
+        tab1,tab2,tab3,tab4,tab5,tab6=st.tabs([
             tr("register_patient"),
             "Triage & Referral",
             "High-Risk Follow-ups",
             "Patient History",
+            "Chronic Care Registry",
+            "Maternal & Child Health",
         ])
 
         with tab1:
@@ -886,6 +1281,7 @@ elif page==tr("asha"):
                 raad=c1.text_input(tr("aadhaar_id")+" (patient's)", placeholder="12-digit Aadhaar number")
                 rph=c2.text_input(tr("phone")+" (optional)")
                 rl=c1.selectbox(tr("language"),["Marathi","Hindi","Tamil","Telugu","Bengali","English"])
+                r_scheme=c2.checkbox(tr("scheme_eligible"))
                 setup_login=st.checkbox("Set up patient app login now")
                 rpw=st.text_input("Patient password",type="password") if setup_login else ""
                 submitted=st.form_submit_button(tr("register_btn"),type="primary",use_container_width=True)
@@ -906,10 +1302,10 @@ elif page==tr("asha"):
                             aid=gen_abha()
                             conn.execute("""INSERT INTO patients
                                 (abha_id,name,age,gender,village,phone,aadhaar_id,language,created_at,
-                                 password_hash,salt,registered_by_type,registered_by_id,registered_by_name)
-                                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                 password_hash,salt,registered_by_type,registered_by_id,registered_by_name,scheme_eligible)
+                                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                                 (aid,rn,ra,rg,rv,rph,aad_clean,rl,datetime.now().isoformat(),
-                                 h,s,"asha",u["id"],u["name"]))
+                                 h,s,"asha",u["id"],u["name"],1 if r_scheme else 0))
                             conn.commit(); conn.close()
                             st.success(f"Registered! ABHA-linked ID: **{aid}**")
                             if setup_login: st.info(f"Patient can log in using Aadhaar ID {aad_clean}.")
@@ -988,12 +1384,13 @@ elif page==tr("asha"):
                         conn.commit(); conn.close()
                         st.session_state["last_tid"]=tid
                         st.session_state["last_priority"]=priority
+                        st.session_state["last_abha_for_tid"]=abha_id
                         st.markdown(f"### Result: {priority_badge(priority)}",unsafe_allow_html=True)
                         st.write(rationale)
                         st.info(f"Suggested department: **{dept}**")
                         if fud: st.caption(f"Follow-up due: {fud}")
 
-                if st.session_state.get("last_tid"):
+                if st.session_state.get("last_tid") and st.session_state.get("last_abha_for_tid")==abha_id:
                     pr=st.session_state.get("last_priority","GREEN")
                     if pr in ("RED","YELLOW"):
                         st.divider()
@@ -1005,11 +1402,13 @@ elif page==tr("asha"):
                             fac=st.selectbox(tr("select_facility"),facs)
                             if st.button(tr("refer_btn"),type="primary"):
                                 conn=get_conn()
-                                conn.execute("INSERT INTO referrals VALUES(?,?,?,?,?,?,?,?,?,?)",
-                                             (str(uuid.uuid4()),abha_id,st.session_state["last_tid"],fac,"PENDING","","",datetime.now().isoformat(),None,None))
+                                conn.execute("INSERT INTO referrals VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                                             (str(uuid.uuid4()),abha_id,st.session_state["last_tid"],fac,"PENDING","","",datetime.now().isoformat(),None,None,None,None,None,None))
                                 conn.commit(); conn.close()
                                 st.success(f"Referral sent to {fac}.")
                                 del st.session_state["last_tid"]
+                                del st.session_state["last_abha_for_tid"]
+                                st.rerun()
                     else:
                         st.info("GREEN — routine care.")
 
@@ -1052,6 +1451,150 @@ elif page==tr("asha"):
             if ah.empty: st.info("No triage history yet.")
             else: st.dataframe(clean_df(ah),use_container_width=True,hide_index=True)
 
+        with tab5:
+            st.caption("Chronic conditions (diabetes, hypertension, TB, etc.) get a recurring "
+                       "follow-up schedule instead of a single one-time reminder — this is what "
+                       "closes the loop for long-term care, not just acute episodes.")
+            pts5=qdf("SELECT abha_id,name,village FROM patients ORDER BY created_at DESC")
+            if pts5.empty:
+                st.info("Register a patient first.")
+            else:
+                with st.form("chronic_reg_form"):
+                    opts5={f"{r['name']} ({r['village'] or '—'})":r["abha_id"] for _,r in pts5.iterrows()}
+                    picked5=st.selectbox("Select Patient",list(opts5.keys()))
+                    cond=st.selectbox("Condition",CHRONIC_CONDITIONS)
+                    interval=st.number_input("Follow-up interval (days)",min_value=7,max_value=180,value=30,step=1)
+                    if st.form_submit_button("Add to Chronic Care Registry",type="primary"):
+                        abha_sel=opts5[picked5]
+                        next_due=(datetime.now()+timedelta(days=int(interval))).strftime("%Y-%m-%d")
+                        conn=get_conn()
+                        conn.execute("INSERT INTO chronic_registry(id,abha_id,condition,interval_days,next_due_date,active,created_by,created_at) VALUES(?,?,?,?,?,1,?,?)",
+                                     (str(uuid.uuid4()),abha_sel,cond,int(interval),next_due,u["name"],datetime.now().isoformat()))
+                        conn.commit(); conn.close()
+                        st.success(f"{picked5} added to chronic care registry. Next follow-up: {next_due}")
+                        st.rerun()
+
+            st.divider()
+            st.subheader("Chronic Care Worklist (due / overdue)")
+            today=datetime.now().strftime("%Y-%m-%d")
+            chr_due=qdf("""SELECT cr.id,p.name,p.village,p.phone,cr.condition,cr.interval_days,cr.next_due_date
+                           FROM chronic_registry cr JOIN patients p ON p.abha_id=cr.abha_id
+                           WHERE cr.active=1 AND cr.next_due_date<=?
+                           ORDER BY cr.next_due_date ASC""",(today,))
+            if chr_due.empty: st.success("No chronic-care follow-ups due right now.")
+            else:
+                for _,r in chr_due.iterrows():
+                    with st.container(border=True):
+                        cd1,cd2=st.columns([4,1])
+                        cd1.markdown(f"**{r['name']}** ({r['village'] or '—'}) — {r['condition']}")
+                        cd1.caption(f"Due: {r['next_due_date']}  |  Every {r['interval_days']} days  |  {r['phone'] or '—'}")
+                        if cd2.button("Mark Followed-up",key=f"chr_{r['id']}",use_container_width=True):
+                            new_due=(datetime.now()+timedelta(days=int(r["interval_days"]))).strftime("%Y-%m-%d")
+                            conn=get_conn()
+                            conn.execute("UPDATE chronic_registry SET next_due_date=?,last_followup_at=? WHERE id=?",
+                                         (new_due,datetime.now().isoformat(),r["id"]))
+                            conn.commit(); conn.close()
+                            st.success(f"Recorded. Next follow-up scheduled for {new_due}."); st.rerun()
+
+            st.divider()
+            st.subheader("All Chronic Care Patients")
+            chr_all=qdf("""SELECT p.name,p.village,cr.condition,cr.interval_days,cr.next_due_date,cr.active
+                           FROM chronic_registry cr JOIN patients p ON p.abha_id=cr.abha_id ORDER BY cr.next_due_date""")
+            if chr_all.empty: st.info("No chronic-care patients registered yet.")
+            else: st.dataframe(clean_df(chr_all),use_container_width=True,hide_index=True)
+
+        with tab6:
+            st.caption("Maternal (pregnancy/ANC) and child immunization tracking, folded into the "
+                       "same closed-loop system instead of being left as a separate offline register.")
+            mch1,mch2=st.tabs(["Pregnancy / ANC Tracker","Child Immunization"])
+
+            with mch1:
+                pts6=qdf("SELECT abha_id,name,village,gender FROM patients WHERE gender='Female' ORDER BY created_at DESC")
+                if pts6.empty:
+                    st.info("Register a female patient first.")
+                else:
+                    with st.form("mch_preg_form"):
+                        opts6={f"{r['name']} ({r['village'] or '—'})":r["abha_id"] for _,r in pts6.iterrows()}
+                        picked6=st.selectbox("Select Patient",list(opts6.keys()),key="mch_preg_pick")
+                        lmp=st.date_input("Last Menstrual Period (LMP)",max_value=datetime.now().date())
+                        edd=(datetime.combine(lmp,datetime.min.time())+timedelta(days=280)).strftime("%Y-%m-%d")
+                        st.caption(f"Estimated Due Date (EDD): **{edd}**")
+                        high_risk=st.checkbox("Flag as high-risk pregnancy")
+                        if st.form_submit_button("Register Pregnancy",type="primary"):
+                            conn=get_conn()
+                            conn.execute("""INSERT INTO mch_pregnancy
+                                (id,abha_id,lmp_date,edd,anc1_done,anc2_done,anc3_done,anc4_done,high_risk,status,created_by,created_at)
+                                VALUES(?,?,?,?,0,0,0,0,?,'ACTIVE',?,?)""",
+                                (str(uuid.uuid4()),opts6[picked6],str(lmp),edd,1 if high_risk else 0,u["name"],datetime.now().isoformat()))
+                            conn.commit(); conn.close()
+                            st.success(f"Pregnancy registered. EDD: {edd}"); st.rerun()
+
+                st.divider()
+                st.subheader("Active Pregnancies — ANC Visit Tracker")
+                preg_all=qdf("""SELECT mp.id,p.name,p.village,mp.lmp_date,mp.edd,mp.anc1_done,mp.anc2_done,
+                                mp.anc3_done,mp.anc4_done,mp.high_risk
+                             FROM mch_pregnancy mp JOIN patients p ON p.abha_id=mp.abha_id
+                             WHERE mp.status='ACTIVE' ORDER BY mp.edd""")
+                if preg_all.empty: st.info("No active pregnancies tracked yet.")
+                else:
+                    for _,r in preg_all.iterrows():
+                        with st.container(border=True):
+                            hcap=" · HIGH-RISK" if r["high_risk"] else ""
+                            st.markdown(f"**{r['name']}** ({r['village'] or '—'}) — EDD {r['edd']}{hcap}")
+                            ac1,ac2,ac3,ac4,ac5=st.columns(5)
+                            a1=ac1.checkbox("ANC-1",value=bool(r["anc1_done"]),key=f"anc1_{r['id']}")
+                            a2=ac2.checkbox("ANC-2",value=bool(r["anc2_done"]),key=f"anc2_{r['id']}")
+                            a3=ac3.checkbox("ANC-3",value=bool(r["anc3_done"]),key=f"anc3_{r['id']}")
+                            a4=ac4.checkbox("ANC-4",value=bool(r["anc4_done"]),key=f"anc4_{r['id']}")
+                            if ac5.button("Save",key=f"ancsave_{r['id']}",use_container_width=True):
+                                conn=get_conn()
+                                conn.execute("UPDATE mch_pregnancy SET anc1_done=?,anc2_done=?,anc3_done=?,anc4_done=? WHERE id=?",
+                                             (int(a1),int(a2),int(a3),int(a4),r["id"]))
+                                conn.commit(); conn.close()
+                                st.success("ANC visits updated."); st.rerun()
+
+            with mch2:
+                pts7=qdf("SELECT abha_id,name,village FROM patients ORDER BY created_at DESC")
+                if pts7.empty:
+                    st.info("Register a patient first (the child can be registered as a normal patient).")
+                else:
+                    with st.form("mch_child_form"):
+                        opts7={f"{r['name']} ({r['village'] or '—'})":r["abha_id"] for _,r in pts7.iterrows()}
+                        picked7=st.selectbox("Select Child (registered patient)",list(opts7.keys()),key="mch_child_pick")
+                        child_name=st.text_input("Child's name (if different from patient record)")
+                        dob=st.date_input("Date of Birth",max_value=datetime.now().date(),key="mch_child_dob")
+                        if st.form_submit_button("Register Child & Generate Immunization Schedule",type="primary"):
+                            cid=str(uuid.uuid4())
+                            conn=get_conn()
+                            conn.execute("INSERT INTO mch_child(id,abha_id,child_name,dob,created_by,created_at) VALUES(?,?,?,?,?,?)",
+                                         (cid,opts7[picked7],child_name or picked7,str(dob),u["name"],datetime.now().isoformat()))
+                            conn.commit(); conn.close()
+                            generate_immunization_schedule(cid,opts7[picked7],str(dob),u["name"])
+                            st.success("Child registered and immunization schedule generated."); st.rerun()
+
+                st.divider()
+                st.subheader("Immunization Due-List (overdue / upcoming 30 days)")
+                today=datetime.now().strftime("%Y-%m-%d")
+                soon=(datetime.now()+timedelta(days=30)).strftime("%Y-%m-%d")
+                imm_due=qdf("""SELECT mi.id,p.name,p.village,mi.vaccine_name,mi.due_date
+                              FROM mch_immunization mi JOIN patients p ON p.abha_id=mi.abha_id
+                              WHERE mi.given=0 AND mi.due_date<=?
+                              ORDER BY mi.due_date ASC""",(soon,))
+                if imm_due.empty: st.success("No immunizations due in the next 30 days.")
+                else:
+                    for _,r in imm_due.iterrows():
+                        with st.container(border=True):
+                            overdue=r["due_date"]<today
+                            ic1,ic2=st.columns([4,1])
+                            ic1.markdown(f"{'**OVERDUE**' if overdue else 'Upcoming'} — **{r['name']}** ({r['village'] or '—'}): {r['vaccine_name']}")
+                            ic1.caption(f"Due: {r['due_date']}")
+                            if ic2.button("Mark Given",key=f"imm_{r['id']}",use_container_width=True):
+                                conn=get_conn()
+                                conn.execute("UPDATE mch_immunization SET given=1,given_date=? WHERE id=?",
+                                             (datetime.now().strftime("%Y-%m-%d"),r["id"]))
+                                conn.commit(); conn.close()
+                                st.success("Marked as given."); st.rerun()
+
 # ══════════════════════════════════════════════════════════════
 # PAGE: DOCTOR DASHBOARD
 # ══════════════════════════════════════════════════════════════
@@ -1091,29 +1634,40 @@ elif page==tr("doctor"):
         mc2.metric("Pending Referrals",pending_ref)
         mc3.metric("Pending Appointments",pending_appts)
 
-        dt1,dt2,dt3,dt4,dt5=st.tabs([
-            "Queue","Search Patient","Appointments","My History","SOS Alerts"
+        dt1,dt2,dt3,dt4,dt5,dt6=st.tabs([
+            "Queue","Search Patient","Appointments","My History","SOS Alerts","Diagnostic Orders"
         ])
 
         with dt1:
             q_sql="""SELECT r.id as ref_id,p.abha_id,p.name,p.age,p.gender,p.village,
-                            t.symptoms_text,t.priority,t.rationale,t.department,t.created_by,r.status,r.created_at
+                            t.symptoms_text,t.priority,t.rationale,t.department,t.created_by,
+                            r.status,r.created_at,r.acknowledged_at,r.acknowledged_by,r.escalated_from
                      FROM referrals r JOIN patients p ON p.abha_id=r.abha_id
                      JOIN triage t ON t.id=r.triage_id
-                     WHERE r.facility=? AND r.status='PENDING'"""
+                     WHERE r.facility=? AND r.status IN ('PENDING','ACKNOWLEDGED')"""
             queue=qdf(q_sql,(u["facility"],))
             if queue.empty: st.info("No pending referrals.")
             else:
                 queue["sort"]=queue["priority"].map(PRIORITY_ORDER)
                 queue=queue.sort_values("sort")
                 for _,row in queue.iterrows():
-                    with st.expander(f"{row['name']} · {row['age'] or '—'}y · {row['priority']} · {row['department'] or 'General Medicine'}",expanded=False):
+                    elapsed_h,breached=compute_sla_status(row["priority"],row["created_at"],row["acknowledged_at"],row["status"])
+                    sla_tag=" ⚠️ SLA BREACH" if breached else ""
+                    with st.expander(f"{row['name']} · {row['age'] or '—'}y · {row['priority']} · {row['status']}{sla_tag}",expanded=(row['status']=='PENDING')):
                         b1,b2=st.columns([3,1])
                         b1.markdown(priority_badge(row["priority"]),unsafe_allow_html=True)
                         b2.markdown(f"**{row['department'] or 'General'}**")
                         st.write(f"**ABHA:** {row['abha_id']}  |  **Village:** {row['village'] or '—'}")
                         st.write(f"**Symptoms:** {row['symptoms_text']}")
                         st.caption(f"AI note: {row['rationale']}")
+                        if elapsed_h is not None:
+                            target=SLA_TARGET_HOURS.get(row["priority"],72)
+                            if breached:
+                                st.error(f"SLA breached — {elapsed_h}h elapsed (target: {target}h for {row['priority']}).")
+                            else:
+                                st.caption(f"Time since referral: {elapsed_h}h (target: {target}h for {row['priority']}).")
+                        if row["escalated_from"]:
+                            st.info(f"This case was escalated here from {row['escalated_from']}.")
                         with st.container(border=True):
                             st.markdown("**Full Patient History**")
                             pht1,pht2=st.tabs(["Past Visits","Past Prescriptions"])
@@ -1125,16 +1679,113 @@ elif page==tr("doctor"):
                                 pr=qdf("SELECT facility,prescription,doctor_notes,completed_at FROM referrals WHERE abha_id=? AND status='COMPLETED' ORDER BY completed_at DESC",(row["abha_id"],))
                                 if pr.empty: st.caption("No past prescriptions.")
                                 else: st.dataframe(clean_df(pr),use_container_width=True,hide_index=True)
-                        if st.button(tr("teleconsult"),key=f"tc_{row['ref_id']}"):
-                            st.info("WebRTC teleconsultation would launch here.")
-                        presc=st.text_area(tr("prescription"),key=f"presc_{row['ref_id']}")
-                        notes=st.text_input("Notes",key=f"notes_{row['ref_id']}")
-                        if st.button(tr("save_prescription"),key=f"save_{row['ref_id']}",type="primary"):
-                            conn=get_conn()
-                            conn.execute("UPDATE referrals SET status='COMPLETED',prescription=?,doctor_notes=?,completed_at=?,doctor_id=? WHERE id=?",
-                                         (presc,notes,datetime.now().isoformat(),u["id"],row["ref_id"]))
-                            conn.commit(); conn.close()
-                            st.success("Completed."); st.rerun()
+
+                        if row["status"]=="PENDING":
+                            st.warning("Awaiting patient arrival at this facility.")
+                            if st.button("Acknowledge Patient Arrival",key=f"ack_{row['ref_id']}",type="primary"):
+                                conn=get_conn()
+                                conn.execute("UPDATE referrals SET status='ACKNOWLEDGED',acknowledged_at=?,acknowledged_by=? WHERE id=?",
+                                             (datetime.now().isoformat(),u["name"],row["ref_id"]))
+                                conn.commit(); conn.close()
+                                notify_all_asha(f"{row['name']} has arrived at {u['facility']} and been acknowledged.","GREEN",abha_id=row["abha_id"])
+                                st.success("Arrival acknowledged."); st.rerun()
+
+                        else:  # ACKNOWLEDGED
+                            st.success(f"Arrival acknowledged on {row['acknowledged_at']} by {row['acknowledged_by']}")
+
+                            with st.container(border=True):
+                                st.markdown(f"**{tr('teleconsult')}**")
+                                tc_state_key=f"tc_active_{row['ref_id']}"
+                                if not st.session_state.get(tc_state_key):
+                                    if st.button(tr("teleconsult"),key=f"tc_{row['ref_id']}"):
+                                        conn=get_conn()
+                                        conn.execute("UPDATE referrals SET teleconsult_started_at=? WHERE id=?",
+                                                     (datetime.now().isoformat(),row["ref_id"]))
+                                        conn.commit(); conn.close()
+                                        st.session_state[tc_state_key]=True; st.rerun()
+                                else:
+                                    st.info("Teleconsultation session in progress — live video isn't wired up in this "
+                                            "prototype, so use this shared notes pad to record the consult.")
+                                    tc_notes=st.text_area("Session notes / chat transcript",key=f"tcnotes_{row['ref_id']}")
+                                    if st.button("End Teleconsultation Session",key=f"tcend_{row['ref_id']}"):
+                                        conn=get_conn()
+                                        conn.execute("UPDATE referrals SET teleconsult_notes=?,teleconsult_ended_at=? WHERE id=?",
+                                                     (tc_notes,datetime.now().isoformat(),row["ref_id"]))
+                                        conn.commit(); conn.close()
+                                        st.session_state[tc_state_key]=False
+                                        st.success("Teleconsultation session saved."); st.rerun()
+
+                            with st.container(border=True):
+                                st.markdown("**Diagnostic Coordination**")
+                                fac_tests=qdf("SELECT test_name FROM diagnostic_tests WHERE facility=? AND available=1 ORDER BY test_name",(u["facility"],))
+                                if fac_tests.empty:
+                                    st.caption("No diagnostic tests set up for this facility yet.")
+                                else:
+                                    dc_t1,dc_t2=st.columns([3,1])
+                                    test_pick=dc_t1.selectbox("Order a test",fac_tests["test_name"].tolist(),key=f"testpick_{row['ref_id']}",label_visibility="collapsed")
+                                    if dc_t2.button("Order Test",key=f"orderTest_{row['ref_id']}",use_container_width=True):
+                                        conn=get_conn()
+                                        conn.execute("""INSERT INTO diagnostic_orders
+                                            (id,abha_id,referral_id,test_name,facility,status,result_notes,ordered_by,ordered_at,completed_at)
+                                            VALUES(?,?,?,?,?,'ORDERED',NULL,?,?,NULL)""",
+                                            (str(uuid.uuid4()),row["abha_id"],row["ref_id"],test_pick,u["facility"],u["name"],datetime.now().isoformat()))
+                                        conn.commit(); conn.close()
+                                        st.success(f"{test_pick} ordered."); st.rerun()
+                                open_orders=qdf("SELECT id,test_name,status,result_notes,ordered_at FROM diagnostic_orders WHERE referral_id=? ORDER BY ordered_at DESC",(row["ref_id"],))
+                                if not open_orders.empty:
+                                    for _,od in open_orders.iterrows():
+                                        if od["status"]=="ORDERED":
+                                            oc1,oc2=st.columns([3,1])
+                                            res_notes=oc1.text_input(f"Result for {od['test_name']}",key=f"res_{od['id']}")
+                                            if oc2.button("Mark Completed",key=f"compTest_{od['id']}",use_container_width=True):
+                                                conn=get_conn()
+                                                conn.execute("UPDATE diagnostic_orders SET status='COMPLETED',result_notes=?,completed_at=? WHERE id=?",
+                                                             (res_notes,datetime.now().isoformat(),od["id"]))
+                                                conn.commit(); conn.close()
+                                                st.success("Result recorded."); st.rerun()
+                                        else:
+                                            st.caption(f"✅ {od['test_name']}: {od['result_notes'] or '—'}")
+
+                            with st.expander("Flag as Chronic Condition (recurring follow-up)"):
+                                cf1,cf2,cf3=st.columns([2,1,1])
+                                cf_cond=cf1.selectbox("Condition",CHRONIC_CONDITIONS,key=f"cfcond_{row['ref_id']}")
+                                cf_interval=cf2.number_input("Every N days",7,180,30,key=f"cfint_{row['ref_id']}")
+                                if cf3.button("Add",key=f"cfadd_{row['ref_id']}",use_container_width=True):
+                                    next_due=(datetime.now()+timedelta(days=int(cf_interval))).strftime("%Y-%m-%d")
+                                    conn=get_conn()
+                                    conn.execute("INSERT INTO chronic_registry(id,abha_id,condition,interval_days,next_due_date,active,created_by,created_at) VALUES(?,?,?,?,?,1,?,?)",
+                                                 (str(uuid.uuid4()),row["abha_id"],cf_cond,int(cf_interval),next_due,u["name"],datetime.now().isoformat()))
+                                    conn.commit(); conn.close()
+                                    st.success(f"Added to chronic care registry. Next follow-up: {next_due}")
+
+                            presc=st.text_area(tr("prescription"),key=f"presc_{row['ref_id']}")
+                            notes=st.text_input("Notes",key=f"notes_{row['ref_id']}")
+                            cc1,cc2=st.columns(2)
+                            if cc1.button(tr("save_prescription"),key=f"save_{row['ref_id']}",type="primary"):
+                                conn=get_conn()
+                                conn.execute("UPDATE referrals SET status='COMPLETED',prescription=?,doctor_notes=?,completed_at=?,doctor_id=? WHERE id=?",
+                                             (presc,notes,datetime.now().isoformat(),u["id"],row["ref_id"]))
+                                conn.commit(); conn.close()
+                                notify_all_asha(f"Referral for {row['name']} completed at {u['facility']}. Prescription issued.","GREEN",abha_id=row["abha_id"])
+                                st.success("Completed."); st.rerun()
+
+                            other_facs=[f for f in get_facility_names() if f!=u["facility"]]
+                            if other_facs:
+                                esc_fac=cc2.selectbox("Escalate to",other_facs,key=f"escfac_{row['ref_id']}",label_visibility="collapsed")
+                                if cc2.button("Escalate / Re-refer",key=f"esc_{row['ref_id']}"):
+                                    conn=get_conn()
+                                    conn.execute("""INSERT INTO referrals
+                                        (id,abha_id,triage_id,facility,status,prescription,doctor_notes,created_at,
+                                         completed_at,doctor_id,acknowledged_at,acknowledged_by,escalated_from,escalated_to)
+                                        SELECT ?,abha_id,triage_id,?,?,'','',?,NULL,NULL,NULL,NULL,?,NULL
+                                        FROM referrals WHERE id=?""",
+                                        (str(uuid.uuid4()), esc_fac, "PENDING", datetime.now().isoformat(), u["facility"], row["ref_id"]))
+                                    conn.execute("UPDATE referrals SET status='COMPLETED',escalated_to=?,completed_at=? WHERE id=?",
+                                                 (esc_fac, datetime.now().isoformat(), row["ref_id"]))
+                                    conn.commit(); conn.close()
+                                    notify_all_asha(f"{row['name']} has been escalated from {u['facility']} to {esc_fac} for further care.","YELLOW",abha_id=row["abha_id"])
+                                    st.success(f"Escalated to {esc_fac}. The ASHA worker has been notified.")
+                                    st.rerun()
 
         with dt2:
             st.subheader("Search Patient")
@@ -1152,7 +1803,11 @@ elif page==tr("doctor"):
                     with st.container(border=True):
                         st.write(f"**Age:** {sel['age'] or '—'}  |  **Gender:** {sel['gender'] or '—'}  |  "
                                  f"**Phone:** {sel['phone'] or '—'}  |  **Aadhaar:** {mask_aadhaar(sel['aadhaar_id'])}")
-                        pht1,pht2=st.tabs(["Triage History","Referrals & Prescriptions"])
+                        st.download_button("Export Interoperable Record (ABDM-lite JSON)",
+                                            data=(fhir_lite_export(sel["abha_id"]) or "{}"),
+                                            file_name=f"{sel['abha_id']}_health_record.json",
+                                            mime="application/json", key=f"exp_{sel['abha_id']}")
+                        pht1,pht2,pht3=st.tabs(["Triage History","Referrals & Prescriptions","Diagnostic Reports"])
                         with pht1:
                             ph=qdf("SELECT symptoms_text,priority,department,temperature,spo2,pulse,created_at FROM triage WHERE abha_id=? ORDER BY created_at DESC",(sel["abha_id"],))
                             if ph.empty: st.caption("No visits.")
@@ -1161,6 +1816,10 @@ elif page==tr("doctor"):
                             rh=qdf("SELECT facility,status,prescription,doctor_notes,completed_at FROM referrals WHERE abha_id=? ORDER BY created_at DESC",(sel["abha_id"],))
                             if rh.empty: st.caption("No referrals.")
                             else: st.dataframe(clean_df(rh),use_container_width=True,hide_index=True)
+                        with pht3:
+                            dh=qdf("SELECT test_name,facility,status,result_notes,ordered_at,completed_at FROM diagnostic_orders WHERE abha_id=? ORDER BY ordered_at DESC",(sel["abha_id"],))
+                            if dh.empty: st.caption("No diagnostic orders.")
+                            else: st.dataframe(clean_df(dh),use_container_width=True,hide_index=True)
             else:
                 st.caption("Type at least 2 characters to search.")
 
@@ -1238,6 +1897,36 @@ elif page==tr("doctor"):
                                 notify_all_doctors(f"SOS for {s['patient_name']} is being handled by Dr. {u['name']}. No further action needed.","GREEN")
                                 st.rerun()
 
+        with dt6:
+            st.subheader("Diagnostic Test Orders — My Facility")
+            st.caption("Every test ordered from the Queue tab shows up here too, so nothing gets lost "
+                       "between ordering and result entry.")
+            all_orders=qdf("""SELECT d.id,p.name,p.village,d.test_name,d.status,d.result_notes,d.ordered_by,d.ordered_at,d.completed_at
+                              FROM diagnostic_orders d JOIN patients p ON p.abha_id=d.abha_id
+                              WHERE d.facility=? ORDER BY d.ordered_at DESC""",(u["facility"],))
+            if all_orders.empty:
+                st.info("No diagnostic tests ordered yet.")
+            else:
+                open_o=all_orders[all_orders["status"]=="ORDERED"]
+                done_o=all_orders[all_orders["status"]=="COMPLETED"]
+                st.markdown(f"**Pending Results ({len(open_o)})**")
+                if open_o.empty: st.caption("Nothing pending.")
+                for _,od in open_o.iterrows():
+                    with st.container(border=True):
+                        oc1,oc2=st.columns([3,1])
+                        oc1.write(f"**{od['name']}** ({od['village'] or '—'}) — {od['test_name']}")
+                        res=oc1.text_input("Result / notes",key=f"dt6res_{od['id']}")
+                        if oc2.button("Complete",key=f"dt6comp_{od['id']}",use_container_width=True):
+                            conn=get_conn()
+                            conn.execute("UPDATE diagnostic_orders SET status='COMPLETED',result_notes=?,completed_at=? WHERE id=?",
+                                         (res,datetime.now().isoformat(),od["id"]))
+                            conn.commit(); conn.close()
+                            st.success("Result recorded."); st.rerun()
+                st.divider()
+                st.markdown(f"**Completed ({len(done_o)})**")
+                if not done_o.empty:
+                    st.dataframe(clean_df(done_o.drop(columns=["id"])),use_container_width=True,hide_index=True)
+
 # ══════════════════════════════════════════════════════════════
 # PAGE: FACILITY / HOSPITAL PORTAL
 # ══════════════════════════════════════════════════════════════
@@ -1262,7 +1951,7 @@ elif page==tr("facility"):
             fm3.metric("Pending Referrals",int(qdf("SELECT COUNT(*) as n FROM referrals WHERE facility=? AND status='PENDING'",(u["name"],))["n"][0]))
             fm4.metric("Pending Appointments",int(qdf("SELECT COUNT(*) as n FROM appointments WHERE facility=? AND status='REQUESTED'",(u["name"],))["n"][0]))
 
-        ft1,ft2=st.tabs(["Staff Management","Medicine Stock"])
+        ft1,ft2,ft3=st.tabs(["Staff Management","Medicine Stock","Diagnostic Tests"])
 
         with ft1:
             sc1,sc2=st.columns(2)
@@ -1314,11 +2003,15 @@ elif page==tr("facility"):
             if stock.empty:
                 st.info("No medicines recorded yet.")
             else:
+                stock["predicted_stockout_days"]=stock["medicine_name"].apply(lambda m: predict_stockout(u["id"], m))
                 def hl(row):
                     if row["quantity"]<10: return ["background-color:#ffcdd2;color:black"]*len(row)
                     return [""]*len(row)
-                st.dataframe(clean_df(stock).style.apply(hl,axis=1),use_container_width=True,hide_index=True)
-                st.caption("Red rows = low stock (below 10 units)")
+                display_stock = stock.drop(columns=["id"])
+                st.dataframe(clean_df(display_stock).style.apply(hl,axis=1),use_container_width=True,hide_index=True)
+                st.caption("Red rows = low stock (below 10 units). 'Predicted stockout days' uses actual "
+                           "restock/dispense history, not just a fixed threshold — blank means not enough "
+                           "history yet.")
 
             st.divider()
             upd_tab,add_tab,log_tab=st.tabs(["Update Existing Stock","Add New Medicine","Change Log"])
@@ -1370,6 +2063,46 @@ elif page==tr("facility"):
                 if log_df.empty: st.caption("No changes logged yet.")
                 else: st.dataframe(clean_df(log_df),use_container_width=True,hide_index=True)
 
+        with ft3:
+            st.subheader("My Diagnostic Test Catalog")
+            st.caption("This feeds both the doctor's 'Order Test' list on referrals and the public "
+                       "Diagnostic Availability page — the same accountability model as Medicine Stock.")
+            diag=qdf("SELECT id,test_name,available,turnaround_hours,last_updated,updated_by FROM diagnostic_tests WHERE facility_id=? ORDER BY test_name",(u["id"],))
+            if diag.empty:
+                st.info("No diagnostic tests recorded yet.")
+            else:
+                st.dataframe(clean_df(diag.drop(columns=["id"])),use_container_width=True,hide_index=True)
+
+            st.divider()
+            dtab1,dtab2=st.tabs(["Toggle Availability / Turnaround","Add New Test"])
+            with dtab1:
+                if diag.empty:
+                    st.caption("Add a test first.")
+                else:
+                    d_labels={f"{r['test_name']} ({'Available' if r['available'] else 'Unavailable'})":r["id"] for _,r in diag.iterrows()}
+                    d_pick=st.selectbox("Select test",list(d_labels.keys()))
+                    d_id=d_labels[d_pick]
+                    d_avail=st.checkbox("Available at this facility",value=True)
+                    d_turn=st.number_input("Turnaround time (hours)",1,240,24)
+                    if st.button("Update Test",type="primary"):
+                        conn=get_conn()
+                        conn.execute("UPDATE diagnostic_tests SET available=?,turnaround_hours=?,last_updated=?,updated_by=? WHERE id=?",
+                                     (1 if d_avail else 0, d_turn, datetime.now().isoformat(), u["name"], d_id))
+                        conn.commit(); conn.close()
+                        st.success("Updated."); st.rerun()
+            with dtab2:
+                with st.form("facility_add_test"):
+                    tn=st.text_input("Test name")
+                    tt=st.number_input("Turnaround time (hours)",1,240,24,key="new_test_turn")
+                    if st.form_submit_button("Add Test",type="primary"):
+                        if not tn: st.error("Test name required.")
+                        else:
+                            conn=get_conn()
+                            conn.execute("INSERT INTO diagnostic_tests(id,facility_id,facility,test_name,available,turnaround_hours,last_updated,updated_by) VALUES(?,?,?,?,1,?,?,?)",
+                                         (str(uuid.uuid4()),u["id"],u["name"],tn,tt,datetime.now().isoformat(),u["name"]))
+                            conn.commit(); conn.close()
+                            st.success(f"Added {tn}."); st.rerun()
+
 # ══════════════════════════════════════════════════════════════
 # PAGE: DISTRICT ADMIN DASHBOARD
 # ══════════════════════════════════════════════════════════════
@@ -1410,6 +2143,19 @@ elif page==tr("admin"):
     tab_fac, tab_area = st.tabs(["Facility-wise View","Area / Village-wise View"])
 
     with tab_fac:
+        st.subheader("Referral Funnel (Closed-Loop Tracking)")
+        pending_n=qdf("SELECT COUNT(*) as n FROM referrals WHERE status='PENDING'")["n"][0]
+        ack_n=qdf("SELECT COUNT(*) as n FROM referrals WHERE status='ACKNOWLEDGED'")["n"][0]
+        completed_n=qdf("SELECT COUNT(*) as n FROM referrals WHERE status='COMPLETED' AND (escalated_to IS NULL OR escalated_to='')")["n"][0]
+        escalated_n=qdf("SELECT COUNT(*) as n FROM referrals WHERE escalated_to IS NOT NULL AND escalated_to!=''")["n"][0]
+        fc1,fc2,fc3,fc4=st.columns(4)
+        fc1.metric("Pending (awaiting arrival)",pending_n)
+        fc2.metric("Acknowledged (arrived)",ack_n)
+        fc3.metric("Completed",completed_n)
+        fc4.metric("Escalated to another facility",escalated_n)
+        st.caption("Every referral is tracked from creation through facility acknowledgment to completion "
+                   "(or escalation to a higher facility) — no case is left as an isolated, unresolved step.")
+
         ch1,ch2=st.columns(2)
         with ch1:
             st.subheader("Triage by Priority")
@@ -1439,6 +2185,34 @@ elif page==tr("admin"):
         fac_dir=qdf("SELECT name,type,village,phone,created_at FROM facilities ORDER BY created_at DESC")
         if fac_dir.empty: st.info("No facilities registered yet.")
         else: st.dataframe(clean_df(fac_dir),use_container_width=True,hide_index=True)
+
+        st.divider()
+        st.subheader("Quality Monitoring — SLA & Patient Feedback")
+        st.caption("Turns the referral funnel above from 'did it happen' into 'how well did it happen' — "
+                   "the accountability and quality-monitoring signal the problem statement asks for.")
+        # NOTE: priority lives on the triage row, not on the referral row —
+        # this must join to triage, otherwise SQLite raises
+        # "no such column: priority" (this was the crash reported).
+        sla_rows=qdf("""SELECT t.priority as priority, r.created_at as created_at,
+                                r.acknowledged_at as acknowledged_at, r.status as status
+                         FROM referrals r JOIN triage t ON t.id=r.triage_id""")
+        breach_count=0; total_checked=0
+        if not sla_rows.empty:
+            for _,r in sla_rows.iterrows():
+                _,breached=compute_sla_status(r["priority"],r["created_at"],r["acknowledged_at"],r["status"])
+                total_checked+=1
+                if breached: breach_count+=1
+        fb=qdf("SELECT feedback_rating FROM referrals WHERE feedback_rating IS NOT NULL")
+        avg_rating=round(fb["feedback_rating"].astype(float).mean(),2) if not fb.empty else None
+        diag_orders_total=qdf("SELECT COUNT(*) as n FROM diagnostic_orders")["n"][0]
+        diag_orders_done=qdf("SELECT COUNT(*) as n FROM diagnostic_orders WHERE status='COMPLETED'")["n"][0]
+        q1,q2,q3,q4=st.columns(4)
+        q1.metric("SLA Breaches",f"{breach_count}/{total_checked}")
+        q2.metric("Avg Patient Rating",f"{avg_rating} / 5" if avg_rating else "No ratings yet")
+        q3.metric("Diagnostics Ordered",diag_orders_total)
+        q4.metric("Diagnostics Completed",diag_orders_done)
+        st.caption(f"SLA targets: RED within {SLA_TARGET_HOURS['RED']}h, YELLOW within {SLA_TARGET_HOURS['YELLOW']}h, "
+                   f"GREEN within {SLA_TARGET_HOURS['GREEN']}h of referral creation.")
 
     with tab_area:
         st.subheader("Village / Area-wise Overview")
@@ -1502,31 +2276,3 @@ elif page==tr("admin"):
     low=qdf("SELECT facility,medicine_name,quantity,unit FROM medicine_stock WHERE quantity<10 ORDER BY quantity")
     if low.empty: st.success("No low-stock alerts.")
     else: st.dataframe(clean_df(low),use_container_width=True,hide_index=True)
-
-# ══════════════════════════════════════════════════════════════
-# PAGE: MEDICINE AVAILABILITY (public, read-only)
-# ══════════════════════════════════════════════════════════════
-elif page==tr("medicine"):
-    st.subheader(tr("medicine"))
-    st.caption("Public read-only view. To update stock levels, log in through the "
-               "Facility / Hospital portal — every change there is tied to the facility that made it.")
-    facs=["All"]+get_facility_names()
-    s1,s2=st.columns(2)
-    fac_filter=s1.selectbox("Facility",facs,key="med_fac_filter")
-    med_search=s2.text_input("Search medicine name",key="med_search")
-
-    sql="SELECT facility,medicine_name,quantity,unit,last_updated FROM medicine_stock WHERE 1=1"
-    params=[]
-    if fac_filter!="All": sql+=" AND facility=?"; params.append(fac_filter)
-    if med_search: sql+=" AND medicine_name LIKE ?"; params.append(f"%{med_search}%")
-    sql+=" ORDER BY facility,medicine_name"
-    stock=qdf(sql,tuple(params))
-
-    def hl(row):
-        if row["quantity"]<10: return ["background-color:#ffcdd2;color:black"]*len(row)
-        return [""]*len(row)
-
-    if stock.empty: st.info("No medicines found.")
-    else:
-        st.dataframe(clean_df(stock).style.apply(hl,axis=1),use_container_width=True,hide_index=True)
-        st.caption("Red rows = low stock (below 10 units)")
