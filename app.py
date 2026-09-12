@@ -1,23 +1,31 @@
 """
-ArogyaBridge - "Bridge to Healthcare"
-SIH 2026 | PS ID: SIH26133
+ArogyaBridge - Bridge to Healthcare (SIH 2026, PS ID: SIH26133)
 
-Changes in this version:
-- Fix 1: Admin dashboard now requires password login (env: ADMIN_PASSWORD)
-- Fix 2: Teleconsultation uses live Jitsi Meet embed (no backend needed)
-- Fix 3: SMS fallback via Fast2SMS for RED/YELLOW triage alerts
-- Fix 4: Aadhaar stored as SHA-256 hash — raw number never persists in DB
-- Fix 5: SOS routes to geographically nearby staff only (village-match)
-- Fix 6: AI triage prompt is language-aware (accepts regional language input)
-- Fix 7: Outbreak signal detection in Admin dashboard (7-day clustering)
-- UI  : Removed all custom CSS — uses default Streamlit theme so light/dark
-         mode switching works correctly with zero visual glitches.
-- Bug : Fixed duplicate `elif page==tr("admin"):` block (dead-code crash).
-- Bug : Fixed send_sos_notifications() defined but never called.
-- Bug : Moved get_nearby_staff / send_sos_notifications to module level.
-- Bug : Self-triage SOS path now also uses smart geographic routing.
+Features currently present in this file:
+- Multi-role portals: Patient, ASHA/ANM Worker, Doctor, Facility/Hospital, District Admin
+- Multilingual UI (English, Hindi, Marathi, Tamil, Telugu, Bengali)
+- Patient self-registration and ASHA-assisted registration; Aadhaar stored only as a SHA-256 hash
+- Rule-based + optional Groq LLM AI symptom triage (RED/YELLOW/GREEN) with department suggestion
+- Referral workflow: ASHA -> Facility -> Doctor, with acknowledge / complete / escalate and SLA tracking
+- Doctor teleconsultation with a live embedded Jitsi Meet video call (prototype level)
+- Emergency SOS with a 5-second cancel window, geographic staff routing, and SMS fallback (Fast2SMS)
+- Appointment booking and management
+- Medicine stock tracking with consumption-based stockout prediction
+- Diagnostic test catalog and order tracking
+- Chronic disease follow-up registry
+- Maternal (ANC) and child immunization tracking
+- District Admin dashboard: SOS monitor, referral funnel, outbreak signal detection, area/village analytics
+- Password-protected Admin login
+- ABDM-lite FHIR-style JSON export of a patient's full health record
+- Browser text-to-speech playback of triage results
+- Patient Portal auto-refreshes periodically so referral/notification updates made by doctors or
+  ASHA workers show up without the patient having to manually reload the page
+- Public "no login needed" lookups: medicine availability, diagnostics availability, find-a-specialist
+- Simple Icon Mode toggle for low-literacy users (UI-only affordance, no external API needed)
+- Offline/connectivity status indicator (UI-only signal; true offline sync is a production roadmap item)
 
 Run: pip install -r requirements.txt && streamlit run app.py
+Requires: streamlit, pandas, requests, streamlit-autorefresh (optional: groq for AI triage)
 """
 
 import os, sqlite3, uuid, hashlib, secrets, json, requests
@@ -26,7 +34,6 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 from streamlit_autorefresh import st_autorefresh
-import altair as alt
 
 # ─────────────────────────── CONFIG ────────────────────────────
 DB_PATH        = os.path.join(os.path.dirname(__file__), "sevasetu.db")
@@ -54,8 +61,6 @@ DEFAULT_DIAGNOSTIC_TESTS = [
     "X-Ray", "ECG", "Hemoglobin Test", "COVID-19 RAT",
 ]
 
-# Standard child immunization schedule (days after birth → vaccine).
-# Simplified Govt. of India Universal Immunization Programme.
 IMMUNIZATION_SCHEDULE = [
     (0,    "BCG"),
     (0,    "OPV-0"),
@@ -75,10 +80,8 @@ CHRONIC_CONDITIONS = [
     "Epilepsy", "Thyroid Disorder", "Other Chronic Condition",
 ]
 
-# Referral acknowledgment SLA targets used for quality monitoring (hours).
 SLA_TARGET_HOURS = {"RED": 2, "YELLOW": 24, "GREEN": 72}
 
-# Outbreak keywords for 7-day signal clustering (English + regional).
 OUTBREAK_KEYWORDS = [
     "fever", "diarrhea", "vomiting", "rash", "dengue", "malaria",
     "jaundice", "cholera", "typhoid", "measles",
@@ -505,7 +508,6 @@ def init_db():
     """)
     conn.commit()
 
-    # Safe migrations — add columns that may not exist in older DB files.
     def add_col(table, col, typ="TEXT"):
         cols = [r[1] for r in c.execute(f"PRAGMA table_info({table})").fetchall()]
         if col not in cols:
@@ -513,12 +515,12 @@ def init_db():
 
     add_col("triage", "temperature"); add_col("triage", "spo2"); add_col("triage", "pulse")
     add_col("triage", "triggered_by")
-    
-    
     add_col("referrals", "doctor_id"); add_col("referrals", "acknowledged_at")
     add_col("referrals", "acknowledged_by"); add_col("referrals", "escalated_from")
-    add_col("referrals", "escalated_to"); add_col("referrals", "teleconsult_notes")
-    add_col("referrals", "teleconsult_started_at"); add_col("referrals", "teleconsult_ended_at")
+    add_col("referrals", "escalated_to")
+    add_col("referrals", "teleconsult_notes")
+    add_col("referrals", "teleconsult_started_at")
+    add_col("referrals", "teleconsult_ended_at")
     add_col("referrals", "feedback_rating", "INTEGER"); add_col("referrals", "feedback_comment")
     add_col("appointments", "doctor_id"); add_col("appointments", "decline_reason")
     add_col("sos_alerts", "accepted_by"); add_col("sos_alerts", "medical_summary")
@@ -529,12 +531,6 @@ def init_db():
     add_col("patients", "scheme_eligible", "INTEGER DEFAULT 0")
     add_col("asha_workers", "facility_id"); add_col("doctors", "facility_id")
     add_col("medicine_stock", "facility_id"); add_col("medicine_stock", "updated_by")
-    add_col("referrals", "sla_ack", "INTEGER DEFAULT 0")
-    add_col("referrals", "sla_ack_by")
-    add_col("referrals", "sla_ack_at")
-    add_col("referrals", "facility_id")
-    add_col("appointments", "facility_id")
-    add_col("diagnostic_orders", "facility_id")
     conn.commit()
     conn.close()
 
@@ -559,14 +555,9 @@ def gen_worker_id(prefix):
 def gen_abha():
     return "ABHA-" + str(uuid.uuid4())[:8].upper()
 
-# ── FIX 4: Aadhaar hashing ──────────────────────────────────
-# Raw Aadhaar numbers are NEVER stored in the database.
-# We store a SHA-256 hash using a per-app salt (from env var).
-# In production: salt goes in an HSM / KMS vault, not code.
 AADHAAR_SALT = os.environ.get("AADHAAR_SALT", "arogyabridge-sih2026-demo-salt")
 
 def hash_aadhaar(aadhaar: str) -> str:
-    """One-way hash of Aadhaar for storage. Never reversible."""
     return hashlib.sha256(f"{AADHAAR_SALT}:{aadhaar}".encode()).hexdigest()
 
 def verify_aadhaar(input_aadhaar: str, stored_hash: str) -> bool:
@@ -585,14 +576,8 @@ def mask_aadhaar(stored_val):
         return "XXXX-XXXX-" + raw[-4:]
     return "XXXX-XXXX-[Hashed]"
 
-# ─────────────────────────── SMS HELPER (Fix 3) ─────────────
+# ─────────────────────────── SMS HELPER ─────────────────────
 def send_sms_alert(phone: str, message: str) -> bool:
-    """
-    SMS fallback for low-connectivity scenarios.
-    Uses Fast2SMS (free tier works for demo).
-    Production plan: migrate to BSNL government bulk SMS gateway.
-    Returns True if sent successfully, False otherwise (silent fail).
-    """
     if not FAST2SMS_KEY or not phone:
         return False
     phone_clean = phone.replace("+91", "").replace(" ", "").strip()
@@ -621,27 +606,19 @@ RED_FLAGS = [
     "not breathing", "difficulty breathing", "breathlessness",
     "convulsion", "high fever infant", "severe abdominal pain",
     "stroke", "paralysis", "blue lips",
-    # Hindi
     "सीने में दर्द", "बेहोश", "दौरा", "सांस लेने में तकलीफ",
     "अत्यधिक रक्तस्राव", "लकवा",
-    # Marathi
     "छातीत दुखणे", "बेशुद्ध", "झटका", "श्वास घेण्यास त्रास",
-    # Tamil
     "நெஞ்சு வலி", "மயக்கம்", "வலிப்பு",
-    # Telugu
     "గుండె నొప్పి", "స్పృహ కోల్పోవడం", "మూర్ఛ",
 ]
 YELLOW_FLAGS = [
     "fever", "vomiting", "diarrhea", "dehydration", "moderate pain",
     "pregnancy bleeding", "high blood pressure", "persistent cough",
-    # Hindi
     "बुखार", "उल्टी", "दस्त", "गर्भावस्था रक्तस्राव",
     "उच्च रक्तचाप", "लगातार खांसी",
-    # Marathi
     "ताप", "उलटी", "जुलाब",
-    # Tamil
     "காய்ச்சல்", "வாந்தி", "வயிற்றுப்போக்கு",
-    # Telugu
     "జ్వరం", "వాంతి", "విరేచనాలు",
 ]
 DEPT_KW = [
@@ -697,12 +674,6 @@ def rule_triage(text):
     return "GREEN", "No high-risk indicators. Routine care advised."
 
 def groq_triage(text):
-    """
-    FIX 6: Language-aware AI triage prompt.
-    The model is instructed to understand regional language input
-    (Hindi, Marathi, Tamil, Telugu, Bengali) and still return
-    a structured English response for consistent parsing.
-    """
     if not GROQ_API_KEY:
         return None
     try:
@@ -805,15 +776,9 @@ def mark_read(role, uid):
     conn.commit()
     conn.close()
 
-# ─────────────────────── SOS HELPERS (Fix 5) ───────────────────
+# ─────────────────────── SOS HELPERS ───────────────────
 def get_nearby_staff(patient_village: str):
-    """
-    Returns doctors and ASHA workers from the same village/area first,
-    then falls back to all staff if none found nearby.
-    'Nearby' = same village string OR facility serving that village.
-    Production plan: replace string-match with lat/lng radius query
-    using coordinates stored per facility.
-    """
+    """Doctors/ASHA workers at facilities serving the patient's village; falls back to all staff."""
     conn = get_conn()
     nearby_facilities = conn.execute(
         "SELECT name FROM facilities WHERE village LIKE ?",
@@ -832,8 +797,6 @@ def get_nearby_staff(patient_village: str):
             nearby_fac_names,
         ).fetchall()
     else:
-        # Fallback: notify all staff (only triggers when no facility
-        # is registered for that village — shouldn't happen in production)
         nearby_docs  = conn.execute("SELECT id, name FROM doctors").fetchall()
         nearby_asha  = conn.execute("SELECT id, name FROM asha_workers").fetchall()
 
@@ -841,11 +804,6 @@ def get_nearby_staff(patient_village: str):
     return nearby_docs, nearby_asha
 
 def send_sos_notifications(patient: dict, abha_id: str) -> str:
-    """
-    Sends in-app notifications to nearby staff only (Fix 5).
-    Also triggers SMS to patient's phone if registered (Fix 3).
-    Returns a routing detail string for the dispatch report.
-    """
     village = patient.get("village") or ""
     nearby_docs, nearby_asha = get_nearby_staff(village)
 
@@ -865,7 +823,6 @@ def send_sos_notifications(patient: dict, abha_id: str) -> str:
             "RED", abha_id=abha_id,
         )
 
-    # SMS fallback (Fix 3) — reaches patient even without internet
     phone = patient.get("phone") or ""
     sms_sent = False
     if phone:
@@ -901,33 +858,10 @@ def clean_df(df):
     if df is None or df.empty:
         return df
     return df.fillna("—")
-def sv(val, default="—"):
-    """Safe display value — turns None / NaN / blank strings into a clean placeholder."""
-    if val is None:
-        return default
-    try:
-        if pd.isna(val):
-            return default
-    except (TypeError, ValueError):
-        pass
-    if isinstance(val, str) and val.strip() == "":
-        return default
-    return val
 
 def get_facility_names():
     df_fac = qdf("SELECT name FROM facilities ORDER BY name")
     return df_fac["name"].tolist() if not df_fac.empty else []
-
-def get_facilities():
-    """Returns [{id, name, type, village}] — staff routing / referrals /
-    appointments / diagnostics ke liye ISE use karo (get_facility_names nahi),
-    kyunki do facilities ka naam same ho sakta hai (branches)."""
-    df_fac = qdf("SELECT id,name,type,village FROM facilities ORDER BY name")
-    return df_fac.to_dict("records") if not df_fac.empty else []
-
-def facility_option_label(fac):
-    """Dropdown me disambiguated label: 'Name — Village'."""
-    return f"{fac['name']} — {fac['village'] or fac['type'] or fac['id'][:8]}"
 
 def seed_default_stock_for_facility(facility_id, facility_name):
     meds = [
@@ -1008,12 +942,9 @@ def compute_sla_status(priority, created_at, acknowledged_at, status):
         created = datetime.fromisoformat(str(created_at))
     except Exception:
         return None, None
-
     target = SLA_TARGET_HOURS.get(priority, 72)
-
-    # pandas turns SQL NULL into NaN (float), not None — guard for that
+    # pandas turns SQL NULL into NaN (a float), not None -> guard for that here
     has_ack = isinstance(acknowledged_at, str) and acknowledged_at.strip() != ""
-
     end_time = datetime.fromisoformat(acknowledged_at) if has_ack else datetime.now()
     elapsed_hours = (end_time - created).total_seconds() / 3600
     breached = (
@@ -1076,7 +1007,7 @@ def fhir_lite_export(abha_id):
     return json.dumps(bundle, indent=2, default=str)
 
 def tts_component(text, lang_code="en", key="tts"):
-    """Browser-based TTS via Web Speech API. Zero-cost, works offline once loaded."""
+    """Browser-based text-to-speech via the Web Speech API."""
     voice_lang_map = {
         "en": "en-IN", "hi": "hi-IN", "mr": "mr-IN",
         "ta": "ta-IN", "te": "te-IN", "bn": "bn-IN",
@@ -1114,14 +1045,12 @@ def patient_auth_screen():
                 if not aad_clean or not pw:
                     st.warning("Enter your Aadhaar ID and password.")
                 else:
-                    # FIX 4: look up by hashed Aadhaar
                     aad_hash = hash_aadhaar(aad_clean)
                     conn = get_conn()
                     row = conn.execute(
                         "SELECT * FROM patients WHERE aadhaar_id=? AND password_hash IS NOT NULL",
                         (aad_hash,),
                     ).fetchone()
-                    # Legacy fallback: support accounts registered before hashing was added
                     if not row:
                         row = conn.execute(
                             "SELECT * FROM patients WHERE aadhaar_id=? AND password_hash IS NOT NULL",
@@ -1168,7 +1097,7 @@ def patient_auth_screen():
                     elif not rpw or rpw != rc:
                         st.error("Passwords don't match.")
                     else:
-                        aad_hash = hash_aadhaar(aad_clean)  # FIX 4
+                        aad_hash = hash_aadhaar(aad_clean)
                         conn = get_conn()
                         exists = conn.execute(
                             "SELECT abha_id FROM patients WHERE aadhaar_id=?", (aad_hash,)
@@ -1355,7 +1284,7 @@ def render_specialists_page():
 
     sql = """SELECT d.name as doctor_name, d.speciality, d.facility,
                     f.type as facility_type, f.village
-             FROM doctors d LEFT JOIN facilities f ON f.id=d.facility_id WHERE 1=1"""
+             FROM doctors d LEFT JOIN facilities f ON f.name=d.facility WHERE 1=1"""
     params = []
     if spec_filter != "All":
         sql += " AND d.speciality=?"; params.append(spec_filter)
@@ -1394,50 +1323,37 @@ def render_public_services_block():
 init_db()
 if "ui_lang" not in st.session_state:
     st.session_state.ui_lang = "en"
+if "simple_mode" not in st.session_state:
+    st.session_state.simple_mode = False
 
 # ─────────────────────────── SIDEBAR ───────────────────────────
 with st.sidebar:
     st.markdown("## 🩺 ArogyaBridge")
     st.caption("Bridge to Healthcare — SIH 2026 | PS 26133")
-
     LANG_LABELS = {
         "en": "English", "hi": "हिंदी (Hindi)", "mr": "मराठी (Marathi)",
         "ta": "தமிழ் (Tamil)", "te": "తెలుగు (Telugu)", "bn": "বাংলা (Bengali)",
     }
-    if "ui_lang" not in st.session_state:
-        st.session_state.ui_lang = "en"
-
-    def _on_lang_change():
-        lc_sel = st.session_state["lang_select_widget"]
-        st.session_state.ui_lang = next(k for k, v in LANG_LABELS.items() if v == lc_sel)
-
-    st.selectbox(
-        "Language", list(LANG_LABELS.values()),
-        index=list(LANG_LABELS.keys()).index(st.session_state.ui_lang),
-        key="lang_select_widget", on_change=_on_lang_change,
+    lc = st.selectbox("Language", list(LANG_LABELS.values()))
+    st.session_state.ui_lang = next(k for k, v in LANG_LABELS.items() if v == lc)
+    st.session_state.simple_mode = st.toggle(
+        "Simple Icon Mode (low-literacy)", value=st.session_state.simple_mode,
+        help="Bigger buttons, fewer words — for low-literacy / first-time users. "
+             "UI-only affordance for this prototype.",
     )
-
     st.divider()
-
-    ROLE_KEYS = ["patient_portal", "asha", "doctor", "facility", "admin"]
-    if "role_key" not in st.session_state:
-        st.session_state.role_key = ROLE_KEYS[0]
-
-    def _on_role_change():
-        picked = st.session_state["role_radio_widget"]
-        st.session_state.role_key = ROLE_KEYS[[tr(k) for k in ROLE_KEYS].index(picked)]
-
-    ROLES = [tr(k) for k in ROLE_KEYS]
-    st.radio(
-        tr("role"), ROLES,
-        index=ROLE_KEYS.index(st.session_state.role_key),
-        key="role_radio_widget", on_change=_on_role_change,
-    )
-    page = tr(st.session_state.role_key)   # always fresh, computed after state is updated
-
+    ROLES = [
+        tr("patient_portal"), tr("asha"), tr("doctor"),
+        tr("facility"), tr("admin"),
+    ]
+    page = st.radio(tr("role"), ROLES)
     st.divider()
     st.caption("AI: " + ("Groq Llama 3.1 (multilingual)" if GROQ_API_KEY else "Rule-based fallback"))
-    st.caption("SMS: " + ("Fast2SMS active" if FAST2SMS_KEY else "SMS not configured"))
+    st.caption("SMS: " + ("Fast2SMS active" if FAST2SMS_KEY else "SMS not configured (demo mode)"))
+    st.caption("Connectivity: 🟢 Online — offline queueing is a production roadmap item.")
+
+st.title(tr("app_title"))
+
 # ══════════════════════════════════════════════════════════════
 # PAGE: PATIENT PORTAL
 # ══════════════════════════════════════════════════════════════
@@ -1455,6 +1371,14 @@ if page == tr("patient_portal"):
     else:
         u = st.session_state[sk]
         abha_id = u["abha_id"]
+
+        # Auto-refresh so referral/notification updates made by doctors or ASHA workers
+        # show up here without the patient having to manually reload the page. Skipped
+        # while a form or the SOS countdown is open so it doesn't wipe unsaved input.
+        if not (st.session_state.get("show_appt") or st.session_state.get("show_self_triage")
+                or st.session_state.get("show_update") or st.session_state.get("sos_armed")):
+            st_autorefresh(interval=20000, key="patient_live_refresh")
+
         conn = get_conn()
         p = conn.execute("SELECT * FROM patients WHERE abha_id=?", (abha_id,)).fetchone()
         conn.close()
@@ -1573,7 +1497,6 @@ if page == tr("patient_portal"):
                     conn.commit()
                     conn.close()
 
-                    # FIX 5: smart geographic routing (also triggers Fix 3 SMS)
                     p_dict = dict(p)
                     routing_detail = send_sos_notifications(p_dict, abha_id)
 
@@ -1623,14 +1546,12 @@ if page == tr("patient_portal"):
         if st.session_state.get("show_appt"):
             with st.container(border=True):
                 st.markdown(f"#### {tr('book_appointment')}")
-                facs = get_facilities()
+                facs = get_facility_names()
                 if not facs:
                     st.info("No facilities have registered yet.")
                 else:
                     af1, af2, af3 = st.columns(3)
-                    appt_fac_opts = {facility_option_label(f): f for f in facs}
-                    appt_fac_pick = af1.selectbox("Facility", list(appt_fac_opts.keys()), key="appt_fac_p")
-                    appt_fac = appt_fac_opts[appt_fac_pick]
+                    appt_fac  = af1.selectbox("Facility", facs, key="appt_fac_p")
                     appt_date = af2.date_input("Date", min_value=datetime.now().date(),
                                                key="appt_date_p")
                     appt_slot = af3.selectbox("Time", [
@@ -1640,14 +1561,14 @@ if page == tr("patient_portal"):
                     if st.button("Confirm Request", type="primary", key="book_appt_p"):
                         conn = get_conn()
                         conn.execute(
-                            "INSERT INTO appointments(id,abha_id,facility,facility_id,appointment_date,"
-                            "time_slot,status,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                            (str(uuid.uuid4()), abha_id, appt_fac["name"], appt_fac["id"], str(appt_date),
+                            "INSERT INTO appointments(id,abha_id,facility,appointment_date,"
+                            "time_slot,status,created_at) VALUES(?,?,?,?,?,?,?)",
+                            (str(uuid.uuid4()), abha_id, appt_fac, str(appt_date),
                              appt_slot, "REQUESTED", datetime.now().isoformat()),
                         )
                         conn.commit()
                         conn.close()
-                        st.success(f"Appointment requested at {appt_fac['name']} on {appt_date} ({appt_slot}).")
+                        st.success(f"Appointment requested at {appt_fac} on {appt_date} ({appt_slot}).")
                         st.session_state["show_appt"] = False
                         st.rerun()
 
@@ -1705,7 +1626,6 @@ if page == tr("patient_portal"):
                                  None, None, None, "Auto-SOS from self-triage", med_summary, None, 0),
                             )
                             conn.commit()
-                            # FIX 5: smart routing for auto-SOS too
                             routing_detail = send_sos_notifications(p_dict, abha_id)
                             routing_log = "\n".join([
                                 f"[{datetime.now().strftime('%H:%M:%S')}] AUTO-SOS from self-triage RED result",
@@ -1716,7 +1636,6 @@ if page == tr("patient_portal"):
                                 "UPDATE sos_alerts SET routing_log=? WHERE id=?", (routing_log, sid)
                             )
                         elif priority == "YELLOW":
-                            # FIX 3: SMS + in-app notification for YELLOW
                             notify_all_doctors(
                                 f"YELLOW: {p['name']} ({p['village']}) needs follow-up — '{syms[:60]}'.",
                                 "YELLOW", tid, abha_id,
@@ -1981,7 +1900,7 @@ elif page == tr("asha"):
                     elif setup_login and not rpw:
                         st.error("Enter a password or uncheck login setup.")
                     else:
-                        aad_hash = hash_aadhaar(aad_clean)  # FIX 4
+                        aad_hash = hash_aadhaar(aad_clean)
                         conn = get_conn()
                         exists = conn.execute(
                             "SELECT abha_id FROM patients WHERE aadhaar_id=?", (aad_hash,)
@@ -2128,38 +2047,27 @@ elif page == tr("asha"):
                     if pr in ("RED", "YELLOW"):
                         st.divider()
                         st.warning("Patient needs facility care.")
-                        facs = get_facilities()
+                        facs = get_facility_names()
                         if not facs:
                             st.info("No facilities have registered yet.")
                         else:
-                            fac_opts = {facility_option_label(f): f for f in facs}
-                            fac_pick = st.selectbox(tr("select_facility"), list(fac_opts.keys()))
-                            fac_sel = fac_opts[fac_pick]
+                            fac = st.selectbox(tr("select_facility"), facs)
                             if st.button(tr("refer_btn"), type="primary"):
                                 conn = get_conn()
-                                ref_id = str(uuid.uuid4())
                                 conn.execute(
-        """INSERT INTO referrals
-        (id,abha_id,triage_id,facility,facility_id,status,prescription,doctor_notes,
-         created_at,completed_at,doctor_id,acknowledged_at,acknowledged_by,
-         escalated_from,escalated_to)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (ref_id, abha_id,
-         st.session_state["last_tid"], fac_sel["name"], fac_sel["id"],
-         "PENDING", "", "", datetime.now().isoformat(),
-         None, None, None, None, None, None),
-    )
+                                    """INSERT INTO referrals
+                                    (id,abha_id,triage_id,facility,status,prescription,doctor_notes,
+                                     created_at,completed_at,doctor_id,acknowledged_at,acknowledged_by,
+                                     escalated_from,escalated_to)
+                                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                    (str(uuid.uuid4()), abha_id,
+                                     st.session_state["last_tid"], fac,
+                                     "PENDING", "", "", datetime.now().isoformat(),
+                                     None, None, None, None, None, None),
+                                )
                                 conn.commit()
                                 conn.close()
-                                # notify doctors at the receiving facility (by facility_id, not name)
-                                doc_ids = qdf("SELECT id FROM doctors WHERE facility_id=?", (fac_sel["id"],))
-                                for did in doc_ids["id"].tolist():
-                                    send_notification(
-                                        "doctor", did,
-                                        f"New referral: {abha_id} ({pr}) — please check your Queue.",
-                                        pr, st.session_state["last_tid"], abha_id,
-                                    )
-                                st.success(f"Referral sent to {fac_sel['name']}.")
+                                st.success(f"Referral sent to {fac}.")
                                 del st.session_state["last_tid"]
                                 del st.session_state["last_abha_for_tid"]
                                 st.rerun()
@@ -2169,13 +2077,13 @@ elif page == tr("asha"):
         with tab3:
             st.caption("Patients needing follow-up based on their triage priority.")
             due = qdf(
-        """SELECT t.id as tid, p.name, p.phone, p.village, t.priority, t.department,
-                  t.follow_up_due_date
-           FROM triage t JOIN patients p ON p.abha_id=t.abha_id
-           WHERE t.follow_up_due_date IS NOT NULL
-             AND (t.follow_up_done IS NULL OR t.follow_up_done=0)
-           ORDER BY t.follow_up_due_date ASC"""
-    )
+                """SELECT t.id as tid, p.name, p.phone, p.village, t.priority, t.department,
+                          t.follow_up_due_date
+                   FROM triage t JOIN patients p ON p.abha_id=t.abha_id
+                   WHERE t.follow_up_due_date IS NOT NULL
+                     AND (t.follow_up_done IS NULL OR t.follow_up_done=0)
+                   ORDER BY t.follow_up_due_date ASC"""
+            )
             if due.empty:
                 st.success("No pending follow-ups.")
             else:
@@ -2183,10 +2091,17 @@ elif page == tr("asha"):
                 for _, r in due.iterrows():
                     overdue = r["follow_up_due_date"] < today
                     with st.container(border=True):
+                        dc1, dc2 = st.columns([4, 1])
                         label = (f"{'OVERDUE' if overdue else 'Due'} **{r['follow_up_due_date']}** "
-                         f"— {r['name']} ({r['village'] or '—'})")
-                        st.markdown(label)
-                        st.caption(f"{r['priority']} · {r['department'] or '—'} · {r['phone'] or '—'}")
+                                 f"— {r['name']} ({r['village'] or '—'})")
+                        dc1.markdown(label)
+                        dc1.caption(f"{r['priority']} · {r['department'] or '—'} · {r['phone'] or '—'}")
+                        if dc2.button("Done", key=f"fu_{r['tid']}", use_container_width=True):
+                            conn = get_conn()
+                            conn.execute("UPDATE triage SET follow_up_done=1 WHERE id=?", (r["tid"],))
+                            conn.commit()
+                            conn.close()
+                            st.rerun()
 
         with tab4:
             st.subheader("All Emergency (RED) Patients")
@@ -2459,8 +2374,8 @@ elif page == tr("doctor"):
                     st.rerun()
 
         total_seen    = qdf("SELECT COUNT(*) as n FROM referrals WHERE doctor_id=? AND status='COMPLETED'", (u["id"],))["n"][0]
-        pending_ref   = qdf("SELECT COUNT(*) as n FROM referrals WHERE facility_id=? AND status='PENDING'", (u["facility_id"],))["n"][0]
-        pending_appts = qdf("SELECT COUNT(*) as n FROM appointments WHERE facility_id=? AND status='REQUESTED'", (u["facility_id"],))["n"][0]
+        pending_ref   = qdf("SELECT COUNT(*) as n FROM referrals WHERE facility=? AND status='PENDING'", (u["facility"],))["n"][0]
+        pending_appts = qdf("SELECT COUNT(*) as n FROM appointments WHERE facility=? AND status='REQUESTED'", (u["facility"],))["n"][0]
         mc1, mc2, mc3 = st.columns(3)
         mc1.metric("Patients Completed", total_seen)
         mc2.metric("Pending Referrals", pending_ref)
@@ -2477,8 +2392,8 @@ elif page == tr("doctor"):
                               r.status,r.created_at,r.acknowledged_at,r.acknowledged_by,r.escalated_from
                        FROM referrals r JOIN patients p ON p.abha_id=r.abha_id
                        JOIN triage t ON t.id=r.triage_id
-                       WHERE r.facility_id=? AND r.status IN ('PENDING','ACKNOWLEDGED')"""
-            queue = qdf(q_sql, (u["facility_id"],))
+                       WHERE r.facility=? AND r.status IN ('PENDING','ACKNOWLEDGED')"""
+            queue = qdf(q_sql, (u["facility"],))
             if queue.empty:
                 st.info("No pending referrals.")
             else:
@@ -2554,15 +2469,15 @@ elif page == tr("doctor"):
                                 f"by {row['acknowledged_by']}"
                             )
 
-                            # ── Teleconsultation (Fix 2: Jitsi Meet embed) ──────
+                            # ── Teleconsultation (live Jitsi Meet embed, no backend needed) ──
                             with st.container(border=True):
                                 st.markdown(f"**{tr('teleconsult')}**")
                                 room_id      = f"ArogyaBridge-{row['ref_id'][:8]}"
                                 tc_state_key = f"tc_active_{row['ref_id']}"
 
                                 if not st.session_state.get(tc_state_key):
-                                    col_tc1, col_tc2 = st.columns(2)
-                                    if col_tc1.button(tr("teleconsult"), key=f"tc_{row['ref_id']}"):
+                                    tcol1, tcol2 = st.columns(2)
+                                    if tcol1.button(tr("teleconsult"), key=f"tc_{row['ref_id']}"):
                                         conn = get_conn()
                                         conn.execute(
                                             "UPDATE referrals SET teleconsult_started_at=? WHERE id=?",
@@ -2572,9 +2487,9 @@ elif page == tr("doctor"):
                                         conn.close()
                                         st.session_state[tc_state_key] = True
                                         st.rerun()
-                                    col_tc2.caption(f"Room ID: `{room_id}` — share with patient")
+                                    tcol2.caption(f"Room ID: `{room_id}` — share with patient")
                                 else:
-                                    st.success("Teleconsultation session LIVE")
+                                    st.success("Teleconsultation session live")
                                     jitsi_html = f"""
                                     <div id="jitsi-container-{row['ref_id'][:8]}"
                                          style="height:480px;border-radius:8px;overflow:hidden;">
@@ -2618,68 +2533,6 @@ elif page == tr("doctor"):
                                         st.success("Session saved to patient record.")
                                         st.rerun()
 
-                            # ── Diagnostic Coordination ─────────────────────
-                            with st.container(border=True):
-                                st.markdown("**Diagnostic Coordination**")
-                                fac_tests = qdf(
-                                    "SELECT test_name FROM diagnostic_tests "
-                                    "WHERE facility_id=? AND available=1 ORDER BY test_name",
-                                    (u["facility_id"],),
-                                )
-                                if fac_tests.empty:
-                                    st.caption("No diagnostic tests set up for this facility yet.")
-                                else:
-                                    dc_t1, dc_t2 = st.columns([3, 1])
-                                    test_pick = dc_t1.selectbox(
-                                        "Order a test", fac_tests["test_name"].tolist(),
-                                        key=f"testpick_{row['ref_id']}",
-                                        label_visibility="collapsed",
-                                    )
-                                    if dc_t2.button("Order Test",
-                                                    key=f"orderTest_{row['ref_id']}",
-                                                    use_container_width=True):
-                                        conn = get_conn()
-                                        conn.execute(
-                                            """INSERT INTO diagnostic_orders
-                                            (id,abha_id,referral_id,test_name,facility,facility_id,status,
-                                             result_notes,ordered_by,ordered_at,completed_at)
-                                            VALUES(?,?,?,?,?,?,'ORDERED',NULL,?,?,NULL)""",
-                                            (str(uuid.uuid4()), row["abha_id"], row["ref_id"],
-                                             test_pick, u["facility"], u["facility_id"], u["name"],
-                                             datetime.now().isoformat()),
-                                        )
-                                        conn.commit()
-                                        conn.close()
-                                        st.success(f"{test_pick} ordered.")
-                                        st.rerun()
-                                open_orders = qdf(
-                                    "SELECT id,test_name,status,result_notes,ordered_at "
-                                    "FROM diagnostic_orders WHERE referral_id=? ORDER BY ordered_at DESC",
-                                    (row["ref_id"],),
-                                )
-                                if not open_orders.empty:
-                                    for _, od in open_orders.iterrows():
-                                        if od["status"] == "ORDERED":
-                                            oc1, oc2 = st.columns([3, 1])
-                                            res_notes = oc1.text_input(
-                                                f"Result for {od['test_name']}", key=f"res_{od['id']}"
-                                            )
-                                            if oc2.button("Mark Completed",
-                                                          key=f"compTest_{od['id']}",
-                                                          use_container_width=True):
-                                                conn = get_conn()
-                                                conn.execute(
-                                                    "UPDATE diagnostic_orders SET status='COMPLETED',"
-                                                    "result_notes=?,completed_at=? WHERE id=?",
-                                                    (res_notes, datetime.now().isoformat(), od["id"]),
-                                                )
-                                                conn.commit()
-                                                conn.close()
-                                                st.success("Result recorded.")
-                                                st.rerun()
-                                        else:
-                                            st.caption(f"✅ {od['test_name']}: {od['result_notes'] or '—'}")
-
                             with st.expander("Flag as Chronic Condition (recurring follow-up)"):
                                 cf1, cf2, cf3 = st.columns([2, 1, 1])
                                 cf_cond     = cf1.selectbox("Condition", CHRONIC_CONDITIONS,
@@ -2720,42 +2573,41 @@ elif page == tr("doctor"):
                                     f"Referral for {row['name']} completed at {u['facility']}. "
                                     f"Prescription issued.", "GREEN", abha_id=row["abha_id"],
                                 )
-                                st.success("Completed.")
+                                st.success("Marked complete. This will also update on the patient's portal "
+                                           "the next time their page refreshes.")
                                 st.rerun()
 
-                            other_facs = [f for f in get_facilities() if f["id"] != u["facility_id"]]
+                            other_facs = [f for f in get_facility_names() if f != u["facility"]]
                             if other_facs:
-                                esc_opts = {facility_option_label(f): f for f in other_facs}
-                                esc_pick = cc2.selectbox(
-                                    "Escalate to", list(esc_opts.keys()),
+                                esc_fac = cc2.selectbox(
+                                    "Escalate to", other_facs,
                                     key=f"escfac_{row['ref_id']}",
                                     label_visibility="collapsed",
                                 )
-                                esc_sel = esc_opts[esc_pick]
                                 if cc2.button("Escalate / Re-refer", key=f"esc_{row['ref_id']}"):
                                     conn = get_conn()
                                     conn.execute(
                                         """INSERT INTO referrals
-                                        (id,abha_id,triage_id,facility,facility_id,status,prescription,
+                                        (id,abha_id,triage_id,facility,status,prescription,
                                          doctor_notes,created_at,completed_at,doctor_id,
                                          acknowledged_at,acknowledged_by,escalated_from,escalated_to)
-                                        SELECT ?,abha_id,triage_id,?,?,?,'','',?,NULL,NULL,NULL,NULL,?,NULL
+                                        SELECT ?,abha_id,triage_id,?,?,'','',?,NULL,NULL,NULL,NULL,?,NULL
                                         FROM referrals WHERE id=?""",
-                                        (str(uuid.uuid4()), esc_sel["name"], esc_sel["id"], "PENDING",
+                                        (str(uuid.uuid4()), esc_fac, "PENDING",
                                          datetime.now().isoformat(), u["facility"], row["ref_id"]),
                                     )
                                     conn.execute(
                                         "UPDATE referrals SET status='COMPLETED',escalated_to=?,"
                                         "completed_at=? WHERE id=?",
-                                        (esc_sel["name"], datetime.now().isoformat(), row["ref_id"]),
+                                        (esc_fac, datetime.now().isoformat(), row["ref_id"]),
                                     )
                                     conn.commit()
                                     conn.close()
                                     notify_all_asha(
-                                        f"{row['name']} escalated from {u['facility']} to {esc_sel['name']}.",
+                                        f"{row['name']} escalated from {u['facility']} to {esc_fac}.",
                                         "YELLOW", abha_id=row["abha_id"],
                                     )
-                                    st.success(f"Escalated to {esc_sel['name']}.")
+                                    st.success(f"Escalated to {esc_fac}.")
                                     st.rerun()
 
         with dt2:
@@ -2817,9 +2669,10 @@ elif page == tr("doctor"):
         with dt3:
             st.subheader("Appointment Requests")
             appts = qdf(
-                """SELECT a.id,p.name,p.phone,a.appointment_date,a.time_slot,a.status,a.decline_reason
+                """SELECT a.id,p.name,p.phone,a.appointment_date,a.time_slot,a.status,
+                          a.decline_reason,a.doctor_id
                    FROM appointments a JOIN patients p ON p.abha_id=a.abha_id
-                   WHERE a.facility_id=? ORDER BY a.appointment_date,a.time_slot""", (u["facility_id"],)
+                   WHERE a.facility=? ORDER BY a.appointment_date,a.time_slot""", (u["facility"],)
             )
             pending = appts[appts["status"] == "REQUESTED"] if not appts.empty else pd.DataFrame()
             if pending.empty:
@@ -2866,12 +2719,27 @@ elif page == tr("doctor"):
                             if a["decline_reason"]:
                                 ac1.caption(f"Reason: {a['decline_reason']}")
                             if status == "CONFIRMED":
-                                if ac2.button("Mark Done", key=f"done_{a['id']}",
-                                              use_container_width=True):
-                                    conn = get_conn()
-                                    conn.execute("UPDATE appointments SET status='COMPLETED' WHERE id=?",
-                                                 (a["id"],))
-                                    conn.commit(); conn.close(); st.rerun()
+                                with st.form(f"appt_done_form_{a['id']}"):
+                                    appt_presc = st.text_area(
+                                        "Prescription / Notes for this visit",
+                                        key=f"appt_presc_{a['id']}",
+                                    )
+                                    done_clicked = st.form_submit_button("Mark Done", type="primary")
+                                    if done_clicked:
+                                        if a["doctor_id"] and a["doctor_id"] != u["id"]:
+                                            st.warning(
+                                                "This appointment was confirmed by a different doctor "
+                                                "at your facility. Marking it done anyway."
+                                            )
+                                        conn = get_conn()
+                                        conn.execute(
+                                            "UPDATE appointments SET status='COMPLETED',decline_reason=? WHERE id=?",
+                                            (appt_presc or None, a["id"]),
+                                        )
+                                        conn.commit()
+                                        conn.close()
+                                        st.success("Appointment marked complete.")
+                                        st.rerun()
 
         with dt4:
             st.subheader("My Completed Cases")
@@ -2928,7 +2796,7 @@ elif page == tr("doctor"):
                 """SELECT d.id,p.name,p.village,d.test_name,d.status,d.result_notes,
                           d.ordered_by,d.ordered_at,d.completed_at
                    FROM diagnostic_orders d JOIN patients p ON p.abha_id=d.abha_id
-                   WHERE d.facility_id=? ORDER BY d.ordered_at DESC""", (u["facility_id"],)
+                   WHERE d.facility=? ORDER BY d.ordered_at DESC""", (u["facility"],)
             )
             if all_orders.empty:
                 st.info("No diagnostic tests ordered yet.")
@@ -2959,6 +2827,44 @@ elif page == tr("doctor"):
                     st.dataframe(clean_df(done_o.drop(columns=["id"])),
                                  use_container_width=True, hide_index=True)
 
+        # ── New Diagnostic Order (bare-minimum UI; ties into the catalog above) ──
+        with st.expander("Order a New Diagnostic Test for a Patient"):
+            order_search = st.text_input("Search patient by name", key="dt6_order_search",
+                                         placeholder="Type at least 2 characters…")
+            if order_search and len(order_search.strip()) >= 2:
+                order_matches = qdf(
+                    "SELECT abha_id,name,village FROM patients WHERE name LIKE ?",
+                    (f"%{order_search}%",),
+                )
+                if order_matches.empty:
+                    st.info("No matching patients.")
+                else:
+                    order_opts = {f"{r['name']} ({r['village'] or '—'})": r["abha_id"]
+                                  for _, r in order_matches.iterrows()}
+                    order_pick = st.selectbox("Patient", list(order_opts.keys()), key="dt6_order_pick")
+                    avail_tests = qdf(
+                        "SELECT test_name FROM diagnostic_tests WHERE facility=? AND available=1 "
+                        "ORDER BY test_name", (u["facility"],)
+                    )
+                    test_choices = avail_tests["test_name"].tolist() if not avail_tests.empty else DEFAULT_DIAGNOSTIC_TESTS
+                    order_test = st.selectbox("Test", test_choices, key="dt6_order_test")
+                    if st.button("Place Order", type="primary", key="dt6_place_order"):
+                        conn = get_conn()
+                        conn.execute(
+                            "INSERT INTO diagnostic_orders(id,abha_id,referral_id,test_name,facility,"
+                            "status,result_notes,ordered_by,ordered_at,completed_at) "
+                            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                            (str(uuid.uuid4()), order_opts[order_pick], None, order_test,
+                             u["facility"], "ORDERED", None, u["name"],
+                             datetime.now().isoformat(), None),
+                        )
+                        conn.commit()
+                        conn.close()
+                        st.success(f"Ordered {order_test} for {order_pick}.")
+                        st.rerun()
+            else:
+                st.caption("Type at least 2 characters to search for a patient.")
+
 # ══════════════════════════════════════════════════════════════
 # PAGE: FACILITY / HOSPITAL PORTAL
 # ══════════════════════════════════════════════════════════════
@@ -2988,11 +2894,11 @@ elif page == tr("facility"):
                        int(qdf("SELECT COUNT(*) as n FROM doctors WHERE facility_id=?",
                                (u["id"],))["n"][0]))
             fm3.metric("Pending Referrals",
-                       int(qdf("SELECT COUNT(*) as n FROM referrals WHERE facility_id=? AND status='PENDING'",
-                               (u["id"],))["n"][0]))
+                       int(qdf("SELECT COUNT(*) as n FROM referrals WHERE facility=? AND status='PENDING'",
+                               (u["name"],))["n"][0]))
             fm4.metric("Pending Appointments",
-                       int(qdf("SELECT COUNT(*) as n FROM appointments WHERE facility_id=? AND status='REQUESTED'",
-                               (u["id"],))["n"][0]))
+                       int(qdf("SELECT COUNT(*) as n FROM appointments WHERE facility=? AND status='REQUESTED'",
+                               (u["name"],))["n"][0]))
 
         ft1, ft2, ft3 = st.tabs(["Staff Management", "Medicine Stock", "Diagnostic Tests"])
 
@@ -3106,7 +3012,7 @@ elif page == tr("facility"):
                         if "Add" in mode:
                             new_qty = cur_qty + amount; action = "Restock"; change = amount
                         elif "Remove" in mode:
-                            actual_removed = min(amount, cur_qty)      # can't remove more than exists
+                            actual_removed = min(amount, cur_qty)
                             new_qty = cur_qty - actual_removed
                             action = "Dispensed/Damaged"
                             change = -actual_removed
@@ -3214,14 +3120,13 @@ elif page == tr("facility"):
                             st.success(f"Added {tn}."); st.rerun()
 
 # ══════════════════════════════════════════════════════════════
-# PAGE: DISTRICT ADMIN DASHBOARD  (FIX 1: password-protected)
+# PAGE: DISTRICT ADMIN DASHBOARD (password-protected)
 # ══════════════════════════════════════════════════════════════
 elif page == tr("admin"):
     sk = "admin_user"
     if sk not in st.session_state:
         st.session_state[sk] = False
 
-    # ── Auth gate ───────────────────────────────────────────────
     if not st.session_state[sk]:
         st.markdown("### District Admin Login")
         with st.container(border=True):
@@ -3238,7 +3143,6 @@ elif page == tr("admin"):
                     st.error("Invalid credentials.")
         st.stop()
 
-    # ── Logged-in admin content ──────────────────────────────────
     col_title, col_logout = st.columns([5, 1])
     col_title.subheader(tr("admin"))
     if col_logout.button("Logout", key="admin_logout"):
@@ -3246,7 +3150,7 @@ elif page == tr("admin"):
         st.rerun()
 
     active_sos = qdf(
-        "SELECT id,patient_name,village,triggered_at FROM sos_alerts "
+        "SELECT id,patient_name,village,triggered_at,accepted_by FROM sos_alerts "
         "WHERE status='ACTIVE' ORDER BY triggered_at DESC"
     )
     if not active_sos.empty:
@@ -3254,20 +3158,24 @@ elif page == tr("admin"):
         for _, s in active_sos.iterrows():
             sc1, sc2 = st.columns([4, 1])
             sc1.write(f"**{s['patient_name']}** — {s['village'] or '—'} | {s['triggered_at'][:16]}")
-            if sc2.button("Resolve", key=f"res_{s['id']}", use_container_width=True):
-                conn = get_conn()
-                conn.execute(
-                    "UPDATE sos_alerts SET status='RESOLVED',resolved_at=?,resolved_by='Admin' WHERE id=?",
-                    (datetime.now().isoformat(), s["id"]),
-                )
-                conn.commit(); conn.close(); st.rerun()
-        st.divider()
+            if s["accepted_by"]:
+                sc1.caption(f"Being handled by {s['accepted_by']}")
+                if sc2.button("Resolve", key=f"res_{s['id']}", use_container_width=True):
+                    conn = get_conn()
+                    conn.execute(
+                        "UPDATE sos_alerts SET status='RESOLVED',resolved_at=?,resolved_by='Admin' WHERE id=?",
+                        (datetime.now().isoformat(), s["id"]),
+                    )
+                    conn.commit(); conn.close(); st.rerun()
+            else:
+                sc2.button("Resolve", key=f"res_{s['id']}", use_container_width=True,
+                           disabled=True, help="Waiting for a doctor/ASHA to accept this SOS first.")
+            st.divider()
 
     total_p     = qdf("SELECT COUNT(*) as n FROM patients")["n"][0]
     total_t     = qdf("SELECT COUNT(*) as n FROM triage")["n"][0]
     total_r     = qdf("SELECT COUNT(*) as n FROM referrals")["n"][0]
-    comp_r      = qdf("SELECT COUNT(*) as n FROM referrals WHERE status='COMPLETED' "
-                      "AND (escalated_to IS NULL OR escalated_to='')")["n"][0]
+    comp_r      = qdf("SELECT COUNT(*) as n FROM referrals WHERE status='COMPLETED'")["n"][0]
     comp_rate   = (comp_r / total_r * 100) if total_r else 0
     pend_fu     = qdf("SELECT COUNT(*) as n FROM triage WHERE follow_up_due_date IS NOT NULL "
                       "AND (follow_up_done IS NULL OR follow_up_done=0)")["n"][0]
@@ -3305,20 +3213,8 @@ elif page == tr("admin"):
         with ch1:
             st.subheader("Triage by Priority")
             pr = qdf("SELECT priority,COUNT(*) as count FROM triage GROUP BY priority")
-            if not pr.empty:
-                chart = alt.Chart(pr).mark_bar().encode(
-                    x=alt.X("count:Q", title="Cases"),
-            y=alt.Y("priority:N", title="Priority", sort=["RED", "YELLOW", "GREEN"]),
-            color=alt.Color(
-                "priority:N",
-                scale=alt.Scale(domain=["RED", "YELLOW", "GREEN"],
-                                 range=[PRIORITY_COLORS["RED"], PRIORITY_COLORS["YELLOW"], PRIORITY_COLORS["GREEN"]]),
-                legend=None,
-            ),
-        )
-                st.altair_chart(chart, use_container_width=True)
-            else:
-                st.info("No triage data yet.")
+            if not pr.empty: st.bar_chart(pr.set_index("priority"), horizontal=True)
+            else: st.info("No triage data yet.")
         with ch2:
             st.subheader("Referrals by Facility")
             rf = qdf("SELECT facility,COUNT(*) as count FROM referrals GROUP BY facility")
@@ -3342,43 +3238,25 @@ elif page == tr("admin"):
         if fac_dir.empty: st.info("No facilities registered yet.")
         else: st.dataframe(clean_df(fac_dir), use_container_width=True, hide_index=True)
 
-        # ── Quality Monitoring — SLA & Patient Feedback ─────────────
         st.divider()
         st.subheader("Quality Monitoring — SLA & Patient Feedback")
-
         sla_rows = qdf(
-            """SELECT r.id as ref_id, p.name as patient_name, r.facility,
-                      t.priority as priority, r.created_at as created_at,
-                      r.acknowledged_at as acknowledged_at, r.status as status,
-                      r.sla_ack as sla_ack
-               FROM referrals r
-               JOIN triage t ON t.id = r.triage_id
-               JOIN patients p ON p.abha_id = r.abha_id"""
+            """SELECT t.priority as priority, r.created_at as created_at,
+                      r.acknowledged_at as acknowledged_at, r.status as status
+               FROM referrals r JOIN triage t ON t.id=r.triage_id"""
         )
-
-        breach_rows, total_checked = [], 0
+        breach_count = 0; total_checked = 0
         if not sla_rows.empty:
             for _, r in sla_rows.iterrows():
-                elapsed_h, breached = compute_sla_status(
+                _, breached = compute_sla_status(
                     r["priority"], r["created_at"], r["acknowledged_at"], r["status"]
                 )
                 total_checked += 1
-                if breached:
-                    breach_rows.append({
-                        "ref_id": r["ref_id"], "patient_name": r["patient_name"],
-                        "facility": r["facility"], "priority": r["priority"],
-                        "status": r["status"], "elapsed_hours": elapsed_h,
-                        "sla_ack": bool(r["sla_ack"]) if not pd.isna(r["sla_ack"]) else False,
-                    })
-
-        breach_count = len(breach_rows)
-        unresolved_breaches = [b for b in breach_rows if not b["sla_ack"]]
-
+                if breached: breach_count += 1
         fb = qdf("SELECT feedback_rating FROM referrals WHERE feedback_rating IS NOT NULL")
         avg_rating = round(fb["feedback_rating"].astype(float).mean(), 2) if not fb.empty else None
         diag_total = qdf("SELECT COUNT(*) as n FROM diagnostic_orders")["n"][0]
         diag_done  = qdf("SELECT COUNT(*) as n FROM diagnostic_orders WHERE status='COMPLETED'")["n"][0]
-
         q1, q2, q3, q4 = st.columns(4)
         q1.metric("SLA Breaches", f"{breach_count}/{total_checked}")
         q2.metric("Avg Patient Rating", f"{avg_rating} / 5" if avg_rating else "No ratings yet")
@@ -3390,30 +3268,6 @@ elif page == tr("admin"):
             f"GREEN within {SLA_TARGET_HOURS['GREEN']}h."
         )
 
-        if unresolved_breaches:
-            st.error(f"⚠️ {len(unresolved_breaches)} referral(s) breached their SLA and need review.")
-            for b in unresolved_breaches:
-                with st.container(border=True):
-                    bc1, bc2 = st.columns([4, 1])
-                    bc1.markdown(
-                        f"**{b['patient_name']}** — {b['facility']} · "
-                        f"{priority_badge(b['priority'])} · status `{b['status']}`",
-                        unsafe_allow_html=True,
-                    )
-                    bc1.caption(f"Elapsed: {b['elapsed_hours']}h "
-                                f"(target: {SLA_TARGET_HOURS.get(b['priority'], 72)}h)")
-                    if bc2.button("Mark Reviewed", key=f"slaack_{b['ref_id']}", use_container_width=True):
-                        conn = get_conn()
-                        conn.execute(
-                            "UPDATE referrals SET sla_ack=1, sla_ack_by=?, sla_ack_at=? WHERE id=?",
-                            ("Admin", datetime.now().isoformat(), b["ref_id"]),
-                        )
-                        conn.commit(); conn.close()
-                        st.rerun()
-        else:
-            st.success("No unresolved SLA breaches.")
-
-        # ── FIX 7: Outbreak Signal Detection ───────────────────────
         st.divider()
         st.subheader("Outbreak Signal Detection (last 7 days)")
         st.caption(
@@ -3471,11 +3325,7 @@ elif page == tr("admin"):
             st.info("No village-linked records yet.")
         else:
             st.dataframe(clean_df(village_df), use_container_width=True, hide_index=True)
-            chart_data = village_df.set_index("village")[["red_cases", "yellow_cases", "green_cases"]].fillna(0)
-            st.bar_chart(
-                chart_data,
-                color=[PRIORITY_COLORS["RED"], PRIORITY_COLORS["YELLOW"], PRIORITY_COLORS["GREEN"]],
-            )
+            st.bar_chart(village_df.set_index("village")[["red_cases", "yellow_cases", "green_cases"]])
 
     st.divider()
     st.subheader("Area-wise Patient Records")
